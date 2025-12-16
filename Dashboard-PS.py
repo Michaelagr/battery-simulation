@@ -8,6 +8,16 @@ import locale
 import datetime
 #import test_daily_load
 
+from src.config import (
+    INTERVAL_HOURS,
+    BATTERY_EFFICIENCY,
+    DEFAULT_DEPTH_OF_DISCHARGE,
+    VOLLLASTSTUNDEN_THRESHOLD,
+    DEMAND_CHARGE_HIGH,
+    DEMAND_CHARGE_LOW
+)
+from src.data.processors import handle_german_dst_transitions
+
 
 # Streamlit config
 st.set_page_config(page_title="Batteriesimulation Lastspitzenkappung", layout="wide", page_icon="💙")
@@ -42,68 +52,6 @@ plotly_config = {
 }
 #from graphs import demand_charge
 
-def handle_german_dst_transitions(df):
-    """
-    Handle German DST transitions for 2024 load profile data.
-    
-    2024 German DST transitions:
-    - Spring: 31.03.2024 at 02:00 -> 03:00 (skip 02:00-02:59, set load to 0)
-    - Autumn: 27.10.2024 at 03:00 -> 02:00 (remove duplicated 02:00-02:59)
-    """
-    if 'timestamp' not in df.columns:
-        return df
-    
-    # Ensure timestamp is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-        return df
-    
-    # Create a copy to avoid modifying original
-    df_clean = df.copy()
-    
-    # SPRING 2024: 31.03.2024 - Skip hour 02:00-02:59, set load to 0
-    spring_start = pd.Timestamp('2024-03-31 02:00:00')
-    spring_end = pd.Timestamp('2024-03-31 03:00:00')
-    
-    spring_mask = (df_clean['timestamp'] >= spring_start) & (df_clean['timestamp'] < spring_end)
-    if spring_mask.any():
-        st.info(f"🕐 Sommerzeit-Übergang 2024 (31.03.2024): {spring_mask.sum()} Datenpunkte in der übersprungenen Stunde (02:00-02:59) auf 0 kW gesetzt.")
-        # Set load to 0 for the skipped hour
-        load_cols = [col for col in df_clean.columns if 'load' in col.lower() or 'kw' in col.lower() or 'value' in col.lower()]
-        for col in load_cols:
-            if col in df_clean.columns:
-                df_clean.loc[spring_mask, col] = 0
-    
-    # AUTUMN 2024: 27.10.2024 - Remove duplicated hour 02:00-02:59
-    autumn_start = pd.Timestamp('2024-10-27 02:00:00')
-    autumn_end = pd.Timestamp('2024-10-27 03:00:00')
-    
-    # Look for duplicated timestamps in the autumn transition period
-    autumn_period_mask = (df_clean['timestamp'] >= autumn_start) & (df_clean['timestamp'] < autumn_end)
-    
-    if autumn_period_mask.any():
-        # Find actual duplicates in this period
-        autumn_data = df_clean[autumn_period_mask]
-        duplicated_mask = autumn_data['timestamp'].duplicated(keep='first')
-        
-        if duplicated_mask.any():
-            # Get indices of duplicated entries to remove
-            duplicate_indices = autumn_data[duplicated_mask].index
-            st.info(f"🕐 Winterzeit-Übergang 2024 (27.10.2024): {len(duplicate_indices)} doppelte Datenpunkte in der wiederholten Stunde (02:00-02:59) entfernt.")
-            df_clean = df_clean.drop(duplicate_indices)
-    
-    # Remove any remaining duplicates (safety check)
-    initial_len = len(df_clean)
-    df_clean = df_clean[~df_clean['timestamp'].duplicated(keep='first')]
-    removed_duplicates = initial_len - len(df_clean)
-    
-    if removed_duplicates > 0:
-        st.info(f"🔧 {removed_duplicates} zusätzliche doppelte Zeitstempel entfernt.")
-    
-    # Sort by timestamp to ensure proper order
-    df_clean = df_clean.sort_values('timestamp').reset_index(drop=True)
-    
-    return df_clean
-
 
 
 # .metric-value {font-size: 1.5rem; color: #111; font-weight: bold;}
@@ -111,7 +59,7 @@ st.title("🔋 ecoplanet Batterie-Simulation für Lastspitzenkappung")
 
 #--------------------- Helper Definitions -------------------------
 # Initial battery configuration
-battery_efficiency = 0.9
+battery_efficiency = BATTERY_EFFICIENCY
 discharge_percentage = 0.001
 demand_charge = 200
 template_url = "https://docs.google.com/spreadsheets/d/1xJ3Lk8uy3X8piSt-IUxZgeVYqeOuRG9N/edit?usp=sharing&ouid=114799245841423325825&rtpof=true&sd=true"
@@ -137,7 +85,7 @@ def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, dept
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
     soc = total_capacity  # start fully charged in kWh
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
 
     threshold_kw = df["net_load_kw"].max() - threshold_kw
 
@@ -194,11 +142,11 @@ def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, dept
 
 
 ### New battery simulation
-def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=1):
+def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 20%) in kWh
     soc = total_capacity  # start fully charged in kWh
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     peak = df["load"].max()
     threshold_kw = peak * (threshold_pct / 100)
 
@@ -253,7 +201,7 @@ def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharg
     return df
 
 
-def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=1):
+def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     """
     Battery simulation that only operates during HLZ (Hochlastzeitfenster) windows.
     The battery only charges/discharges when 'in_window' is True.
@@ -261,7 +209,7 @@ def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_dis
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC in kWh
     soc = total_capacity  # start fully charged in kWh
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     
     # Calculate threshold based on peak in HLZ windows only
     hlz_data = df[df['in_window']]
@@ -329,7 +277,7 @@ def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_dis
 
 
 ### New battery simulation
-def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=1):
+def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     # Idee: Peak shifting: Ab ~Juni: 50 % der Kapazität für Load shifting reservieren
         # Zähler n=0, if n>15*24*30*5 ~~20.000:
             # total_capacity = battery_capacity if or(n<20.000, n>40000) else total_capacity =  capactiy_sommer = 0.5* total capacity
@@ -338,7 +286,7 @@ def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharg
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # min SoC in kWh
     soc = total_capacity  # start fully charged
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     peak = df["load"].max()
     threshold_kw = peak * (threshold_pct / 100)
 
@@ -416,11 +364,11 @@ def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharg
     df["battery_charge_grid"] = charge_grid
     return df
 
-def battery_simulation_vpv_selfconsumption_oldf(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=1):
+def battery_simulation_vpv_selfconsumption_oldf(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # min SoC in kWh
     soc = total_capacity  # start fully charged
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     peak = df["load"].max()
     threshold_kw = peak * (threshold_pct / 100)
 
@@ -563,13 +511,13 @@ def optimize_battery_params(df, battery_capacity, power_rating, demand_charge_lo
                 # Run simulation
                 result_df = battery_simulation_vpv_selfconsumption(
                     df.copy(), battery_capacity, power_rating,
-                    80, threshold, base_reserve=base_reserve,
+                    DEFAULT_DEPTH_OF_DISCHARGE, threshold, base_reserve=base_reserve,
                     extra_reserve=extra_reserve
                 )
 
                 vlh = df["grid_load_pv_bt"].sum() /4 / df["grid_load_pv_bt"].max()
-                demand_charge_calc = demand_charge_low if vlh <2500 else demand_charge_high
-                energy_charge_calc = energy_charge_high if vlh < 2500 else energy_charge_low
+                demand_charge_calc = demand_charge_low if vlh < VOLLLASTSTUNDEN_THRESHOLD else demand_charge_high
+                energy_charge_calc = energy_charge_high if vlh < VOLLLASTSTUNDEN_THRESHOLD else energy_charge_low
 
                 # Calculate ROI
                 roi = calculate_roi(result_df, demand_charge_calc, energy_charge_calc)
@@ -610,13 +558,13 @@ def optimize_battery_params_working(df, battery_capacity, power_rating, demand_c
             # Run simulation
             result_df = battery_simulation_vpv_selfconsumption_working(
                 df.copy(), battery_capacity, power_rating,
-                80, threshold,
+                DEFAULT_DEPTH_OF_DISCHARGE, threshold,
                 reserve_fraction = reserve_fraction
             )
 
             vlh = df["grid_load_pv_bt"].sum() / df["grid_load_pv_bt"].max()
-            demand_charge_calc = demand_charge_low if vlh <2500 else demand_charge_high
-            energy_charge_calc = energy_charge_high if vlh < 2500 else energy_charge_low
+            demand_charge_calc = demand_charge_low if vlh < VOLLLASTSTUNDEN_THRESHOLD else demand_charge_high
+            energy_charge_calc = energy_charge_high if vlh < VOLLLASTSTUNDEN_THRESHOLD else energy_charge_low
 
             # Calculate ROI
             roi = calculate_roi(result_df, demand_charge_calc, energy_charge_calc)
@@ -632,7 +580,7 @@ def optimize_battery_params_working(df, battery_capacity, power_rating, demand_c
     return best_params
 
 
-def battery_simulation_vpv_selfconsumption_working(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=0.9, reserve_fraction=0.1):
+def battery_simulation_vpv_selfconsumption_working(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY, reserve_fraction=0.1):
     ################### ELAS CHANGES ###############
     max_load_jump = df["load"].diff().clip(lower=0).max()
     #reserve_fraction = max_load_jump / df["load"].max()
@@ -646,7 +594,7 @@ def battery_simulation_vpv_selfconsumption_working(df, battery_capacity, power_r
     #    reserve_soc = true_min_soc + reserve_amount
 
     soc = total_capacity  # start fully charged
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     peak = df["load"].max()
     threshold_kw = peak * (threshold_pct / 100)
 
@@ -805,7 +753,7 @@ def battery_simulation_vpv_selfconsumption(
     power_rating,
     depth_of_discharge,
     threshold_pct,
-    battery_efficiency=1,
+    battery_efficiency=BATTERY_EFFICIENCY,
     base_reserve=0.3,
     extra_reserve=0.,
     reserve_window_hours=24
@@ -813,7 +761,7 @@ def battery_simulation_vpv_selfconsumption(
     total_capacity = battery_capacity  # kWh
     true_min_soc = total_capacity * (1 - depth_of_discharge / 100)  # min SoC in kWh
     soc = total_capacity  # start fully charged
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
 
     # Calculate threshold for peak shaving
     peak = df["load"].max()
@@ -987,11 +935,11 @@ def battery_simulation_vpv_selfconsumption(
     return df
 
 
-def battery_simulation_ps_with_pv(df, load_series, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=1):
+def battery_simulation_ps_with_pv(df, load_series, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 20%) in kWh
     soc = total_capacity  # start fully charged in kWh
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS
     peak = load_series.max()
     threshold_kw = peak * (threshold_pct / 100)
 
@@ -1123,12 +1071,12 @@ with st.sidebar:
     
     st.write("---")
     st.write(f"**Netznutzungsentgelte**")
-    st.write("**<2500 VLH**")
-    demand_charge_low = st.number_input("💰 Leistungspreis <2500 VLH (in €/kW)", min_value=None, value=20.00)
-    energy_charge_high_input = st.number_input("💲 Arbeitspreis <2500 VLH (in ct/kWh)",min_value=None, value=10.00)
-    st.write(f"**>=2500 VLH**")
-    demand_charge_high = st.number_input("💰️ Leistungspreis >=2500 VLH (in €/kW)", min_value=None, value=183.00)
-    energy_charge_low_input = st.number_input("💲 Arbeitspreis >=2500 VLH (in ct/kWh)", min_value=None, value= 1.00)
+    st.write(f"**<{VOLLLASTSTUNDEN_THRESHOLD} VLH**")
+    demand_charge_low = st.number_input(f"💰 Leistungspreis <{VOLLLASTSTUNDEN_THRESHOLD} VLH (in €/kW)", min_value=None, value=DEMAND_CHARGE_LOW)
+    energy_charge_high_input = st.number_input(f"💲 Arbeitspreis <{VOLLLASTSTUNDEN_THRESHOLD} VLH (in ct/kWh)",min_value=None, value=10.00)
+    st.write(f"**>={VOLLLASTSTUNDEN_THRESHOLD} VLH**")
+    demand_charge_high = st.number_input(f"💰️ Leistungspreis >={VOLLLASTSTUNDEN_THRESHOLD} VLH (in €/kW)", min_value=None, value=DEMAND_CHARGE_HIGH)
+    energy_charge_low_input = st.number_input(f"💲 Arbeitspreis >={VOLLLASTSTUNDEN_THRESHOLD} VLH (in ct/kWh)", min_value=None, value= 1.00)
 
     energy_charge_high = energy_charge_high_input /100
     energy_charge_low = energy_charge_low_input /100
@@ -1227,7 +1175,7 @@ with st.sidebar:
         ### -------------------------------------------------- PV ------------------------------------------------------------ ####
         MAGIC_YEARLY_PV_MULTIPLIER = 800
 
-        INTERVAL_HOURS = 0.25
+        # INTERVAL_HOURS imported from src.config
         
         # Check if custom PV file is uploaded
         if custom_pv_file is not None:
@@ -1371,7 +1319,7 @@ with ((tab_analyse)):
         st.header("Lastgang Übersicht")
 
         st.subheader("📈 Statistik")
-        st.write(f"Von **{df["timestamp"].min()}** bis **{df["timestamp"].max()}**")
+        st.write(f"Von **{df['timestamp'].min()}** bis **{df['timestamp'].max()}**")
 
         col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -1403,12 +1351,12 @@ with ((tab_analyse)):
             with col1:
                 with st.container(border=True):
                     st.subheader("💶 Netznutzungsentgelte")
-                    st.write("**<2500 Vollnutzungsstunden**")
+                    st.write(f"**<{VOLLLASTSTUNDEN_THRESHOLD} Vollnutzungsstunden**")
                     col3, col4 = st.columns(2)
                     col3.metric("Leistungspreis", f"{demand_charge_low:,.2f} €/kW")
                     col4.metric("Arbeitspreis", f"{energy_charge_high_input:,.2f} ct/kW")
 
-                    st.write("**\\>=2500 Vollnutzungsstunden**")
+                    st.write(f"**\\>={VOLLLASTSTUNDEN_THRESHOLD} Vollnutzungsstunden**")
                     col3,col4 = st.columns(2)
 
                     col3.metric("Leistungspreis", f"{demand_charge_high:,.2f} €/kW")
@@ -1426,7 +1374,7 @@ with ((tab_analyse)):
         with tab_agg:
 
             fig_overview_gesamt = px.line(df, x="timestamp", y="load",
-                                   title=f"Lastprofil ab {df["timestamp"].dt.year.min()}",
+                                   title=f"Lastprofil ab {df['timestamp'].dt.year.min()}",
                                    labels={"timestamp": "Zeit", "load": "Last (kW)"}
                                          )
             fig_overview_gesamt.update_layout(height=400, xaxis_title="Zeit")
@@ -1502,7 +1450,7 @@ with ((tab_analyse)):
                         st.metric("Energieverbrauch", f"{total_energy_Mwh:,.0f} MWh")
                         st.metric("Netto Energieverbrauch", f"{positive_load_pv.sum() / 4 / 1000:,.0f} MWh", f"{-(total_energy_Mwh-(positive_load_pv.sum() / 4 / 1000)):,.0f} MWh", delta_color="inverse")
                     with col3_pv:
-                        st.metric("Spitzenlast", f"{df["load"].max():,.0f} kW")
+                        st.metric("Spitzenlast", f"{df['load'].max():,.0f} kW")
                         st.metric("Spitzenlast", f"{positive_load_pv.max():,.0f} kW", f"{-(peak_load-positive_load_pv.max()):,.0f} kW", delta_color="inverse")
                     with col4_pv:
                         st.metric("Volllaststunden", f"{(volllaststunden):,.0f} h")
@@ -1527,11 +1475,11 @@ with ((tab_analyse)):
                         else:
                             st.metric("Max. Leistung", f"{df_pv['yearly_production_kw'].max():,.0f} kWp")
                     with col3_pv:
-                        st.metric("Erzeugte Energie", f"~{df_pv["yearly_production_kw"].sum() / 4 / 1000:,.0f} MWh")
+                        st.metric("Erzeugte Energie", f"~{df_pv['yearly_production_kw'].sum() / 4 / 1000:,.0f} MWh")
                     with col4_pv:
                         st.metric("Eigenverbrauchsquote PV", f"{pv_self_consumption_ratio:,.0f} %")
                     with col5_pv:
-                        st.metric("Autarkiegrad", f"{(df["load"].sum() - (positive_load_pv.sum()))/(df["load"].sum() )*100:,.0f} %", help="Anteil des Gesamtverbrauchs, der durch PV gedeckt wurde")
+                        st.metric("Autarkiegrad", f"{(df['load'].sum() - (positive_load_pv.sum()))/(df['load'].sum() )*100:,.0f} %", help="Anteil des Gesamtverbrauchs, der durch PV gedeckt wurde")
 
                 st.plotly_chart(fig_pv, use_container_width=True, config=plotly_config)
 
@@ -1888,12 +1836,12 @@ with taboptimierer:
                     total_consumption_optimizer = load_array.sum() / 4
                     
                     # EXACT COPY of battery_simulation_ps but using numpy arrays for speed
-                    def battery_simulation_ps_numpy(load_data, battery_capacity, power_rating, threshold_kw, depth_of_discharge=90, battery_efficiency=0.9):
+                    def battery_simulation_ps_numpy(load_data, battery_capacity, power_rating, threshold_kw, depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE, battery_efficiency=BATTERY_EFFICIENCY):
                         # EXACT ORIGINAL LOGIC
                         total_capacity = battery_capacity  # kWh
                         reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
                         soc = total_capacity  # start fully charged in kWh
-                        interval_hours = 0.25  # 15-minute intervals
+                        interval_hours = INTERVAL_HOURS
                         
                         threshold_kw = load_data.max() - threshold_kw
                         
@@ -1958,7 +1906,7 @@ with taboptimierer:
                         # Run numpy-based battery simulation
                         optimized_load = battery_simulation_ps_numpy(
                             load_array, opt_battery_capacity_kwh, opt_battery_power_kw, 
-                            threshold_kw=ps_reduction_value, depth_of_discharge=90, battery_efficiency=0.9
+                            threshold_kw=ps_reduction_value, depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE, battery_efficiency=BATTERY_EFFICIENCY
                         )
                         
                         # Calculate results after peak shaving
@@ -2284,8 +2232,8 @@ with tabsimulation:
                     # Display the current values
                 st.write(f"Gewählte Kapazität: **{st.session_state.battery_capacity} kWh**")
                 st.write(f"Gewählte Leistung: **{st.session_state.power_rating} kW**")
-                st.write(f"Entladungstiefe: **90%**")
-                st.write(f"Roundtrip-Effizienz: **90%**")
+                st.write(f"Entladungstiefe: **{DEFAULT_DEPTH_OF_DISCHARGE}%**")
+                st.write(f"Roundtrip-Effizienz: **{int(BATTERY_EFFICIENCY * 100)}%**")
                 with st.expander("**Kostenannahmen**"):
                     st.session_state.battery_cost_per_kwh = st.number_input("Batterie Kosten pro kWh (€/kWh)", min_value=100, value=st.session_state.battery_cost_per_kwh)
                     system_cost_multiplier = st.number_input("Systemkosten Zusatzfaktor", min_value=1.0, value=1.2)
@@ -2312,10 +2260,10 @@ with tabsimulation:
             with st.container(border=True):
                 st.markdown("### 💰 Netzentgelte", help="Bitte in Seitenleiste links eingeben")
                 with st.expander("Details"):
-                    st.write(f"**\\<= 2500 VLH**")
+                    st.write(f"**\\<= {VOLLLASTSTUNDEN_THRESHOLD} VLH**")
                     st.write(f"Arbeitspreis: {energy_charge_high} ct/kWh, Leistungspreis: {demand_charge_low} €/kw")
-                    st.write(f"**> 2500 VLH**")
-                    st.write(f"Arbeitspreis: {energy_charge_low} ct/kWh, Leistungspreis > 2500 VLH: {demand_charge_high} €/kw")
+                    st.write(f"**> {VOLLLASTSTUNDEN_THRESHOLD} VLH**")
+                    st.write(f"Arbeitspreis: {energy_charge_low} ct/kWh, Leistungspreis > {VOLLLASTSTUNDEN_THRESHOLD} VLH: {demand_charge_high} €/kw")
 
             ## -------------------------------------------  MODIFICATON MONTHS ----------------------------------------------------------------------------
             with st.container(border=True):
@@ -2333,7 +2281,7 @@ with tabsimulation:
                     st.subheader("Bitte Batteriegröße auswählen")
             # -----------------------------        PEAKSHAVING METRICS CALCULATION   -----------------------------------------------------
 
-            df_peakshaving = battery_simulation_v02(df.copy(), st.session_state.battery_capacity, st.session_state.power_rating, 90, calculated_peakshaving_threshold)
+            df_peakshaving = battery_simulation_v02(df.copy(), st.session_state.battery_capacity, st.session_state.power_rating, DEFAULT_DEPTH_OF_DISCHARGE, calculated_peakshaving_threshold)
 
 
             # --------------------------------   METRICS CALCULATION------------------------------------------------
@@ -2347,8 +2295,8 @@ with tabsimulation:
             volllaststunden_peakshaving = grid_energy_peakshaving / peak_peakshaving
 
             # Finance
-            demand_charge_peakshaving = demand_charge_high if volllaststunden_peakshaving > 2500 else demand_charge_low
-            energy_charge_peakshaving = energy_charge_low if volllaststunden_peakshaving > 2500 else energy_charge_high
+            demand_charge_peakshaving = demand_charge_high if volllaststunden_peakshaving > VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
+            energy_charge_peakshaving = energy_charge_low if volllaststunden_peakshaving > VOLLLASTSTUNDEN_THRESHOLD else energy_charge_high
             annual_savings_actual = peak_reduction_peakshaving * demand_charge_peakshaving
             
             total_battery_cost = st.session_state.battery_capacity * st.session_state.battery_cost_per_kwh * system_cost_multiplier
@@ -2486,17 +2434,17 @@ with tabsimulation:
                     col0, col1, col2, col3, col4 = st.columns(5)
                     with col0:
                         st.subheader("Verbrauch")
-                        st.metric("⚡ Gesamtverbrauch", f"{(df_peakshaving["load"].sum() / 1000 / 4):,.0f} MWh")
+                        st.metric("⚡ Gesamtverbrauch", f"{(df_peakshaving['load'].sum() / 1000 / 4):,.0f} MWh")
 
                     with col1:
                         st.subheader("Spitzenlast")
-                        st.metric("🔺 Spitzenlast ohne Batterie", f"{df["load"].max():,.0f} kW")
-                        st.metric("🔸 Spitzenlast mit Batterie", f"{df_peakshaving["grid_load"].max():,.0f} kW",
-                                  f"{df_peakshaving["grid_load"].max() - df["load"].max():,.0f} kW", delta_color="inverse")
+                        st.metric("🔺 Spitzenlast ohne Batterie", f"{df['load'].max():,.0f} kW")
+                        st.metric("🔸 Spitzenlast mit Batterie", f"{df_peakshaving['grid_load'].max():,.0f} kW",
+                                  f"{df_peakshaving['grid_load'].max() - df['load'].max():,.0f} kW", delta_color="inverse")
                     with col2:
                         col2.subheader("Volllaststunden")
-                        st.metric("Ohne Batterie", f"{df_org["load"].sum() / 4 / peak_org:,.0f} h")
-                        st.metric("Mit Batterie", f"{df_org["load"].sum() / 4 / peak_peakshaving:,.0f} h")
+                        st.metric("Ohne Batterie", f"{df_org['load'].sum() / 4 / peak_org:,.0f} h")
+                        st.metric("Mit Batterie", f"{df_org['load'].sum() / 4 / peak_peakshaving:,.0f} h")
                     with col3:
                         st.subheader("Finanzen")
                         st.metric(f"💰 Jährl. Einsparungen (Peak Shaving)",
@@ -2530,9 +2478,9 @@ with tabsimulation:
                     col_1c.subheader("Batteriekosten")
                     col_1c.metric("💶 Geschätzte Investmentkosten", f"~€ {total_battery_cost:,.0f}")
                     col_2c.subheader("Energiekosten")
-                    col_2c.metric("Arbeitspreis", f"{energy_charge_low if volllaststunden_peakshaving > 2500 else energy_charge_high:.2f} €")
+                    col_2c.metric("Arbeitspreis", f"{energy_charge_low if volllaststunden_peakshaving > VOLLLASTSTUNDEN_THRESHOLD else energy_charge_high:.2f} €")
                     col_3c.subheader(" ")
-                    col_3c.metric("Leistungspreis", f"{demand_charge_high if volllaststunden_peakshaving > 2500 else demand_charge_low:.1f} €")
+                    col_3c.metric("Leistungspreis", f"{demand_charge_high if volllaststunden_peakshaving > VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low:.1f} €")
 
                 with st.container(border=True):
                     st.subheader("🔋 Batterie Analyse")
@@ -2557,15 +2505,15 @@ with tabsimulation:
                 calculated_peakshaving_threshold_pv = ((peak_load_pv - value_peak_reduction) / peak_load_pv * 100) if (pv_total > 0 or custom_pv_file is not None) else ((peak_org - value_peak_reduction) / peak_org * 100)
 
                 df_exp_2 = battery_simulation_vpv_selfconsumption_working(df_with_pv, st.session_state.battery_capacity,
-                                                                          st.session_state.power_rating, 90,
+                                                                          st.session_state.power_rating, DEFAULT_DEPTH_OF_DISCHARGE,
                                                                           calculated_peakshaving_threshold_pv)
 
                ########################        VARIABLEN FÜR BATTERIE SIMILATION           ###########################
 
                 volllaststunden_bt_pv_2 = df_exp_2["grid_load_pv_bt"].clip(lower=0).sum() / 4 / df_exp_2["grid_load_pv_bt"].max()
 
-                demand_charge = demand_charge_high if volllaststunden_bt_pv_2 > 2500 else demand_charge_low
-                energy_charge = energy_charge_low if volllaststunden_bt_pv_2 > 2500 else energy_charge_high
+                demand_charge = demand_charge_high if volllaststunden_bt_pv_2 > VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
+                energy_charge = energy_charge_low if volllaststunden_bt_pv_2 > VOLLLASTSTUNDEN_THRESHOLD else energy_charge_high
 
                 energy_exported_mwh = -df_exp_2["grid_load_pv_bt"].clip(upper=0).sum() / 4 / 1000
                 pv_selfcons_kwh = min(
@@ -2591,22 +2539,22 @@ with tabsimulation:
                         st.subheader("⚡ Netzbezug")
                         #st.metric("Netzbezug mit PV", f"{energy_consumed_pv:,.0f} MWh")
                         st.metric("Netzbezug mit PV & Batterie",
-                                  f"{df_exp_2["grid_load_pv_bt"].clip(lower=0).sum() / 4 / 1000:,.0f} MWh",
-                                  f"{df_exp_2["grid_load_pv_bt"].clip(lower=0).sum() / 4 / 1000 - energy_consumed_pv:,.0f} MWh",delta_color="inverse")
+                                  f"{df_exp_2['grid_load_pv_bt'].clip(lower=0).sum() / 4 / 1000:,.0f} MWh",
+                                  f"{df_exp_2['grid_load_pv_bt'].clip(lower=0).sum() / 4 / 1000 - energy_consumed_pv:,.0f} MWh",delta_color="inverse")
                         st.write(f"(Netzbezug ohne Batterie: **{energy_consumed_pv:,.0f}** MWh)\n\n")
 
                 with col_1:
                     with st.container(border=True):
                         st.subheader("🔺 Spitzenlast")
                         #st.metric("Spitzenlast mit PV", f"{peak_load_pv:,.0f} kW")
-                        st.metric("Erreichte Spitzenlast mit PV & Batterie", f"{df_exp_2["grid_load_pv_bt"].max():,.0f} kW",
-                                  f"{df_exp_2["grid_load_pv_bt"].max()-peak_load_pv:,.0f} kW",delta_color="inverse")
+                        st.metric("Erreichte Spitzenlast mit PV & Batterie", f"{df_exp_2['grid_load_pv_bt'].max():,.0f} kW",
+                                  f"{df_exp_2['grid_load_pv_bt'].max()-peak_load_pv:,.0f} kW",delta_color="inverse")
                         st.write(f"(Spitzenlast ohne Batterie: **{peak_load_pv:,.0f}** kW)\n\n")
 
                 with col_2:
                     with st.container(border=True):
-                        vollstring2 = ">= 2500 h" if volllaststunden_bt_pv_2 > 2500 else "< 2500 h"
-                        demand_charge2 = demand_charge_high if volllaststunden_bt_pv_2 > 2500 else demand_charge_low
+                        vollstring2 = f">= {VOLLLASTSTUNDEN_THRESHOLD} h" if volllaststunden_bt_pv_2 > VOLLLASTSTUNDEN_THRESHOLD else f"< {VOLLLASTSTUNDEN_THRESHOLD} h"
+                        demand_charge2 = demand_charge_high if volllaststunden_bt_pv_2 > VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
 
                         st.subheader("⏺️ Volllaststunden")
                         #st.metric("Mit PV", f"{vollaststunden_pv:,.0f} h")
@@ -2621,7 +2569,7 @@ with tabsimulation:
                                 #f"~{savings_ps:,.0f} €"
                                 #f" Durch Reduktion von {(peak_load_pv - df_exp_2["grid_load_pv_bt"].max()):,.0f}kW",
                                 #f"~{savings_ps:,.0f} €")
-                        st.write(f" **{savings_ps:,.0f}€** : Lastreduktion um {(peak_load_pv - df_exp_2["grid_load_pv_bt"].max()):,.0f}kW \n\n  **{annual_savings_selfcons:,.0f}€** : Eigenbedarfsoptimierung" )
+                        st.write(f" **{savings_ps:,.0f}€** : Lastreduktion um {(peak_load_pv - df_exp_2['grid_load_pv_bt'].max()):,.0f}kW \n\n  **{annual_savings_selfcons:,.0f}€** : Eigenbedarfsoptimierung" )
 
                 with col_4:
                     with st.container(border=True):
@@ -2922,30 +2870,30 @@ with tabsimulation:
                     with col1:
                         st.subheader("Energieverbrauch")
                         st.metric("Netzbezug ohne PV", f"{total_energy_kwh/1000:,.0f} MWh")
-                        st.metric("Netzbezug mit PV", f"{df_exp_2["load_pv_pos"].sum()/4/1000:,.0f} MWh")
+                        st.metric("Netzbezug mit PV", f"{df_exp_2['load_pv_pos'].sum()/4/1000:,.0f} MWh")
                         # // Change this to "drawn from battery instead
-                        st.metric("Netzbezug mit PV & Batterie", f"{df_exp_2["grid_load_pv_bt"].clip(lower=0).sum()/4/1000:,.0f} MWh")
+                        st.metric("Netzbezug mit PV & Batterie", f"{df_exp_2['grid_load_pv_bt'].clip(lower=0).sum()/4/1000:,.0f} MWh")
 
                     with col2:
                         st.subheader("Spitzenlast")
                         st.metric("🔺🔺Spitzenlast ohne PV", f"{peak_load:,.0f} kW")
                         st.metric("🔺 Spitzenlast mit PV", f"{peak_load_pv:,.0f} kW", f"{peak_load_pv - peak_load:,.0f} kW",
                                   delta_color="inverse")
-                        st.metric("🔸 Spitzenlast mit PV & Batterie", f"{df_exp_2["grid_load_pv_bt"].max():,.0f} kW",
-                                  f"{df_exp_2["grid_load_pv_bt"].max() - peak_load:,.0f} kW",
+                        st.metric("🔸 Spitzenlast mit PV & Batterie", f"{df_exp_2['grid_load_pv_bt'].max():,.0f} kW",
+                                  f"{df_exp_2['grid_load_pv_bt'].max() - peak_load:,.0f} kW",
                                   delta_color="inverse")
 
                     with col3:
                         st.subheader("Eingespeiste Energie")
-                        st.metric("Einspeisung ins Netz ohne Batterie", f"{-df_exp_2["load_pv_neg"].sum()/4/1000:,.0f} MWh",
+                        st.metric("Einspeisung ins Netz ohne Batterie", f"{-df_exp_2['load_pv_neg'].sum()/4/1000:,.0f} MWh",
                                  help="Summe aller Zeitpunkte mit negativer Netzlast mit PV (PV-Überschuss)")
                         st.metric("Einspeisung ins Netz nach Optimierung", f"{energy_exported_mwh:,.0f} MWh",
                                  help="Summe aller Zeitpunkte mit negativer Netzlast nach Batterie-Optimierung (PV-Überschuss nach Eigenverbrauch und Batterieladung)")
                     with col4:
                         st.subheader("Volllaststunden")
-                        st.metric("Ohne Batterie & ohne PV", f"{df_org["load"].sum() / 4 / peak_org:,.0f} h")
-                        st.metric("Mit PV",f"{df_exp_pv["load"].sum() / 4 / df_exp_pv["load"].max():,.0f} h" )
-                        st.metric("Mit PV & Batterie", f"{df_exp_2["grid_load_pv_bt"].clip(lower=0).sum() / 4 / df_exp_2["grid_load_pv_bt"].max():,.0f} h")
+                        st.metric("Ohne Batterie & ohne PV", f"{df_org['load'].sum() / 4 / peak_org:,.0f} h")
+                        st.metric("Mit PV",f"{df_exp_pv['load'].sum() / 4 / df_exp_pv['load'].max():,.0f} h" )
+                        st.metric("Mit PV & Batterie", f"{df_exp_2['grid_load_pv_bt'].clip(lower=0).sum() / 4 / df_exp_2['grid_load_pv_bt'].max():,.0f} h")
 
 
                 with st.container(border=True):
@@ -3340,14 +3288,14 @@ with tabsimulation:
                                 target_peak_hlz = peak_in_hlz * 0.8  # Fallback to 80% of HLZ peak
                             
                             # Calculate threshold percentage for HLZ peak
-                            hlz_threshold_percentage = (target_peak_hlz / peak_in_hlz * 100) if peak_in_hlz > 0 else 90
+                            hlz_threshold_percentage = (target_peak_hlz / peak_in_hlz * 100) if peak_in_hlz > 0 else DEFAULT_DEPTH_OF_DISCHARGE
                             
                             # Run HLZ-only battery simulation
                             df_peakshaving_atypik = battery_simulation_hlz_only(
                                 df_atypik.copy(), 
                                 st.session_state.battery_capacity, 
                                 st.session_state.power_rating, 
-                                90, 
+                                DEFAULT_DEPTH_OF_DISCHARGE, 
                                 hlz_threshold_percentage
                             )
                             
@@ -3490,15 +3438,15 @@ with tabsimulation:
                             col_b1, col_b2, col_b3, col_b4 = st.columns(4)
                             
                             with col_b1:
-                                charge_energy = df_peakshaving_atypik["battery_charge"].sum() * 0.25  # Convert to kWh
+                                charge_energy = df_peakshaving_atypik["battery_charge"].sum() * INTERVAL_HOURS  # Convert to kWh
                                 st.metric("🔌 Geladene Energie", f"{charge_energy:,.1f} kWh")
                             
                             with col_b2:
-                                discharge_energy = df_peakshaving_atypik["battery_discharge"].sum() * 0.25  # Convert to kWh
+                                discharge_energy = df_peakshaving_atypik["battery_discharge"].sum() * INTERVAL_HOURS  # Convert to kWh
                                 st.metric("🔋 Entladene Energie", f"{discharge_energy:,.1f} kWh")
                             
                             with col_b3:
-                                discharge_in_hlz = df_peakshaving_atypik[df_peakshaving_atypik['in_window']]["battery_discharge"].sum() * 0.25
+                                discharge_in_hlz = df_peakshaving_atypik[df_peakshaving_atypik['in_window']]["battery_discharge"].sum() * INTERVAL_HOURS
                                 st.metric("⚡ Entladung in HLZ", f"{discharge_in_hlz:,.1f} kWh")
                             
                             with col_b4:

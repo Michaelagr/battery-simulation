@@ -1,243 +1,37 @@
+import os
+from datetime import datetime
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-import os
-from datetime import datetime
 
-# === EXTRACTED CONSTANTS FROM ORIGINAL FILE ===
-EXPORT_REVENUE_FACTOR = 0.9
-VOLLLASTSTUNDEN_THRESHOLD = 2500
-DEMAND_CHARGE_HIGH = 174
-DEMAND_CHARGE_LOW = 20
-BATTERY_EFFICIENCY = 0.9
+from src.config import (
+    EXPORT_REVENUE_FACTOR,
+    VOLLLASTSTUNDEN_THRESHOLD,
+    DEMAND_CHARGE_HIGH,
+    DEMAND_CHARGE_LOW,
+    BATTERY_EFFICIENCY,
+    DEFAULT_DEPTH_OF_DISCHARGE,
+    LOW_PRICE_PERCENTILE,
+    HIGH_PRICE_PERCENTILE,
+    MIN_ARBITRAGE_SPREAD,
+    NEGATIVE_PRICE_THRESHOLD,
+    ENABLE_CHART_OPTIMIZATION,
+    MIN_POINTS_FOR_RESAMPLING,
+    RESAMPLE_FREQUENCY,
+    ENABLE_ARBITRAGE,
+    INTERVAL_HOURS
+)
+from src.data.loaders import read_price_data, read_load_profile, load_solar_data
+
+# Legacy constants for backward compatibility (can be removed later)
 PV_CAPACITY_KWP = 0
-LOW_PRICE_PERCENTILE = 30
-HIGH_PRICE_PERCENTILE = 70
-
 DEBUG = 0
 
-# === ARBITRAGE SETTINGS ===
-ENABLE_ARBITRAGE = True
-# Minimum price spread required for profitable arbitrage (in €/kWh, same unit as price data)
-# With 90% efficiency, need at least 11% spread to break even. This adds small margin.
-# 0.005 €/kWh = 0.5 ct/kWh = 5 €/MWh minimum profit margin
-MIN_ARBITRAGE_SPREAD = 0.005
-# Threshold for "very negative" prices where we charge aggressively (in €/kWh)
-# -0.01 €/kWh = -1 ct/kWh = -10 €/MWh
-NEGATIVE_PRICE_THRESHOLD = -0.01
-
-# === PERFORMANCE OPTIMIZATION SETTINGS ===
-# Set to True to enable automatic data resampling for faster chart rendering
-ENABLE_CHART_OPTIMIZATION = True
-# Minimum number of data points before resampling kicks in
-MIN_POINTS_FOR_RESAMPLING = 10000
-# Resampling frequency (e.g., "1H" for hourly, "30T" for 30 minutes)
-RESAMPLE_FREQUENCY = "1H"
-
 # === EXTRACTED FUNCTIONS FROM ORIGINAL FILE ===
-
-def read_price_data(price_year=2024):
-    """Read spot price data for specified year (2024 or 2025)
-    
-    Args:
-        price_year: Year of price data to use (2024 or 2025)
-    
-    Returns:
-        DataFrame with timestamp and price columns
-    """
-    if price_year == 2024:
-        # Read 2024 data
-        price_file = "data/spot_data_2024.xlsx"
-        df_prices = pd.read_excel(price_file)
-        df_prices['timestamp'] = pd.to_datetime(df_prices['timestamp'], format="mixed", dayfirst=True)
-        try:
-            if df_prices['timestamp'].dt.tz is not None:
-                df_prices['timestamp'] = df_prices['timestamp'].dt.tz_localize(None)
-        except (AttributeError, TypeError):
-            pass
-        df_prices['price'] = pd.to_numeric(df_prices['Day-ahead Price (EUR/MWh)'], errors='coerce') / 1000
-        df_prices = df_prices[['timestamp', 'price']].dropna()
-    elif price_year == 2025:
-        # Read 2025 data
-        price_file = "data/spot_data_2025.xlsx"
-        df_prices = pd.read_excel(price_file)
-        df_prices['timestamp'] = pd.to_datetime(df_prices['timestamp'], format="mixed", dayfirst=True)
-        try:
-            if df_prices['timestamp'].dt.tz is not None:
-                df_prices['timestamp'] = df_prices['timestamp'].dt.tz_localize(None)
-        except (AttributeError, TypeError):
-            pass
-        df_prices['price'] = pd.to_numeric(df_prices['spotmarket'], errors='coerce') / 1000
-        df_prices = df_prices[['timestamp', 'price']].dropna()
-    else:
-        raise ValueError(f"Unsupported price year: {price_year}. Use 2024 or 2025.")
-    
-    return df_prices
-
-
-def shift_price_year_to_match_load(df_prices, df_load):
-    """Shift price data year to match load profile year while keeping day/time
-    
-    Args:
-        df_prices: DataFrame with price data
-        df_load: DataFrame with load profile data
-    
-    Returns:
-        DataFrame with prices shifted to match load profile year
-    """
-    # Get the year from the load profile (use the first timestamp)
-    load_year = df_load['timestamp'].dt.year.iloc[0]
-    price_year = df_prices['timestamp'].dt.year.iloc[0]
-    
-    # Calculate year difference
-    year_diff = load_year - price_year
-    
-    if year_diff != 0:
-        # Shift the price timestamps by the year difference
-        df_prices_shifted = df_prices.copy()
-        df_prices_shifted['timestamp'] = df_prices_shifted['timestamp'] + pd.DateOffset(years=year_diff)
-        return df_prices_shifted
-    
-    return df_prices
-
-
-def load_solar_data(pv_total, custom_pv_file=None):
-    """Load and process solar generation data"""
-    MAGIC_YEARLY_PV_MULTIPLIER = 850
-    INTERVAL_HOURS = 0.25
-
-    # Check if custom PV file is uploaded
-    if custom_pv_file is not None:
-        # Load custom PV profile
-        df_pv = pd.read_excel(custom_pv_file)
-        
-        # Find timestamp and PV columns
-        pv_timestamp_col = None
-        pv_load_col = None
-        
-        for col in df_pv.columns:
-            col_lower = str(col).lower()
-            if 'timestamp' in col_lower:
-                pv_timestamp_col = col
-            elif 'pv' in col_lower:
-                pv_load_col = col
-        
-        if pv_timestamp_col is None or pv_load_col is None:
-            st.error("❌ PV-Datei muss Spalten 'timestamp' und 'PV' enthalten!")
-            st.stop()
-        
-        # Process custom PV data
-        try:
-            df_pv["timestamp"] = pd.to_datetime(df_pv[pv_timestamp_col], format="mixed", dayfirst=True)
-        except:
-            try:
-                df_pv["timestamp"] = pd.to_datetime(df_pv[pv_timestamp_col], utc=True)
-            except:
-                df_pv["timestamp"] = pd.to_datetime(df_pv[pv_timestamp_col], dayfirst=True)
-        
-        try:
-            if df_pv["timestamp"].dt.tz is not None:
-                df_pv["timestamp"] = df_pv["timestamp"].dt.tz_localize(None)
-        except (AttributeError, TypeError):
-            pass
-        
-        df_pv["yearly_production_kw"] = pd.to_numeric(df_pv[pv_load_col], errors='coerce')
-        df_pv["yearly_production_kwh"] = df_pv["yearly_production_kw"] * INTERVAL_HOURS
-        
-    else:
-        # Use standard PV profile
-        df_pv = pd.read_csv("data/solar_data_de_small.csv")
-
-        df_pv["timestamp"] = pd.to_datetime(df_pv["timestamp"], format="%d.%m.%y %H:%M").dt.tz_localize(None)
-        df_pv["yearly_production_kw"] = df_pv["yearly_production_fraction"].astype(float).to_numpy().clip(min=0) * pv_total * MAGIC_YEARLY_PV_MULTIPLIER / INTERVAL_HOURS
-        df_pv["yearly_production_kwh"] = df_pv["yearly_production_fraction"].astype(float).to_numpy().clip(min=0) * pv_total * MAGIC_YEARLY_PV_MULTIPLIER
-
-    return df_pv[['timestamp', 'yearly_production_kw', 'yearly_production_kwh']]
-
-
-def read_load_profile(file_path):
-    """Read load profile from Excel file or uploaded file object"""
-    # Handle both file path (string) and uploaded file object
-    if isinstance(file_path, str):
-        # File selected from input folder
-        df = pd.read_excel(file_path)
-    else:
-        # File uploaded via file uploader
-        df = pd.read_excel(file_path)
-    
-    # Try to auto-detect timestamp and load columns
-    col_map = {col.lower(): col for col in df.columns}
-    
-    # Find timestamp column
-    timestamp_col = None
-    for key in ['timestamp', 'time', 'datum', 'date', 'timestamps', 'zeit']:
-        if key in col_map:
-            timestamp_col = col_map[key]
-            break
-    
-    if timestamp_col is None:
-        # Use first column as fallback
-        timestamp_col = df.columns[0]
-    
-    # Convert timestamp column - EXACT COPY from Dashboard-PS.py
-    try:
-        df["timestamp"] = pd.to_datetime(df[timestamp_col], dayfirst=True)
-    except Exception as e1:
-        try:
-            df["timestamp"] = pd.to_datetime(df[timestamp_col], utc=True)
-        except Exception as e2:
-            try:
-                df["timestamp"] = pd.to_datetime(df[timestamp_col], format="mixed", dayfirst=True)
-            except Exception as e3:
-                try:
-                    df["timestamp"] = pd.to_datetime(df[timestamp_col], format="%Y-%m-%dT%H:%M:%S%z")
-                except Exception as e4:
-                    try:
-                        df["timestamp"] = pd.to_datetime(df[timestamp_col], format="ISO8601")
-                    except Exception as e5:
-                        raise ValueError(
-                            f"Datei konnte nicht gelesen werden. Fehler:\n1. {e1}\n2. {e2}\n3. {e3}\n4. {e4}\n5. {e5}")
-    
-    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-    
-    # Try to find the correct column for load in the Excel file
-    load_col = None
-    for col in ['kWh', 'kwh', 'value', 'value_kwh', 'value_kw', 'load', 'kW', 'last', 'leistung', 'power']:
-        if col in df.columns:
-            load_col = col
-            break
-    
-    if load_col is None:
-        # Try case-insensitive search
-        for key, col in col_map.items():
-            if any(kw in key for kw in ['kw', 'load', 'value', 'last', 'leistung', 'power', 'wert']):
-                load_col = col
-                break
-    
-    if load_col is None:
-        st.error("❌ Keine geeignete Last-Spalte gefunden. Bitte stellen Sie sicher, dass die Datei eine Spalte mit 'load', 'kW', 'kWh', oder 'value' enthält.")
-        st.stop()
-
-    # Convert load column to numeric to avoid multiplication errors
-    df[load_col] = pd.to_numeric(df[load_col], errors='coerce').fillna(0)
-
-    # Determine if the load column is in kW or kWh (15-min intervals)
-    if load_col.lower() in ["load", "kw", "leistung", "power"]:
-        df['load_org'] = df[load_col]
-        df['total_kwh'] = df['load_org'] * 0.25
-    elif load_col.lower() in ["kwh", "value_kwh"]:
-        # Assume kWh values for 15-minute intervals, convert to kW
-        df['load_org'] = df[load_col] / 0.25
-        df['total_kwh'] = df['load_org'] * 0.25
-    else:
-        # Default: assume it's kWh and convert to kW
-        df['load_org'] = df[load_col] / 0.25
-        df['total_kwh'] = df['load_org'] * 0.25
-
-    return df
 
 def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, depth_of_discharge, battery_efficiency):
     """
@@ -246,7 +40,7 @@ def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, dept
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
     soc = total_capacity  # start fully charged in kWh
-    interval_hours = 0.25  # 15-minute intervals
+    interval_hours = INTERVAL_HOURS  # 15-minute intervals
 
     threshold_kw = df["net_load_kw"].max() - threshold_kw
 
@@ -315,7 +109,8 @@ def fast_forward_quantile(arr, window, q):
     windows = sliding_window_view(padded, window)   # shape (n, window)
     return np.nanpercentile(windows, q, axis=1)
 
-def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=0, low_price_percentile=30, high_price_percentile=70, custom_pv_file=None, peak_shaving_capacity_percent=100, price_year=2024, demand_charge_high=DEMAND_CHARGE_HIGH, demand_charge_low=DEMAND_CHARGE_LOW):
+# Line 111 - Update function defaults
+def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=0, low_price_percentile=LOW_PRICE_PERCENTILE, high_price_percentile=HIGH_PRICE_PERCENTILE, custom_pv_file=None, peak_shaving_capacity_percent=100, price_year=2024, demand_charge_high=DEMAND_CHARGE_HIGH, demand_charge_low=DEMAND_CHARGE_LOW):
     """
     Run the complete battery analysis for a single file.
     This is the exact algorithm extracted from battery_savings_case_4_v3.py
@@ -341,12 +136,12 @@ def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=
         df_merged = pd.merge(df_merged, df_pv[['merge_key', 'yearly_production_kw', 'yearly_production_kwh']], on='merge_key', how='left')
         df_merged['load_pv'] = df_merged['load_org'] - df_merged['yearly_production_kw']
         df_merged['net_load_kw'] = df_merged['load_pv']
-        df_merged['net_load_kwh'] = df_merged['load_pv'] * 0.25
+        df_merged['net_load_kwh'] = df_merged['load_pv'] * INTERVAL_HOURS
         
         # Battery parameters
         battery_power_kw = power_rating
         battery_capacity_kwh = capacity
-        interval_hours = 0.25
+        interval_hours = INTERVAL_HOURS
         depth_of_discharge = 0.1 * battery_capacity_kwh
         
         # === CASE 4: Smart Battery Implementation ===
@@ -394,7 +189,7 @@ def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=
             # Run battery simulation with this threshold
             df_ps = battery_simulation_ps(
                 df_test, battery_capacity_kwh, battery_power_kw, 
-                threshold_kw=ps_reduction_value, depth_of_discharge=90, battery_efficiency=BATTERY_EFFICIENCY
+                threshold_kw=ps_reduction_value, depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE, battery_efficiency=BATTERY_EFFICIENCY
             )
             
             # Calculate results after peak shaving
@@ -757,7 +552,7 @@ def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=
 def create_load_profile_chart(df, peak_threshold=None, peak_shaving_capacity_percent=100):
     """Create the main load profile visualization with battery operations."""
     # Show progress indicator for large datasets
-    if len(df) > 10000 and DEBUG ==1:
+    if len(df) > MIN_POINTS_FOR_RESAMPLING and DEBUG ==1:
         st.info(f"🔄 Rendering chart with {len(df):,} data points...")
     
     # Ensure data is sorted by timestamp to avoid horizontal lines
@@ -993,7 +788,7 @@ def create_load_profile_chart(df, peak_threshold=None, peak_shaving_capacity_per
             line_dash="dash",
             line_color="grey",
             line_width=2,
-            annotation_text=f"Ursprungs-Spitzenlast: {df_sorted["load_org"].max():.0f} kW",
+            annotation_text=f"Ursprungs-Spitzenlast: {df_sorted['load_org'].max():.0f} kW",
             annotation_position="top left",
             annotation=dict(
                 font=dict(size=12, color="grey"),
@@ -1010,7 +805,7 @@ def create_load_profile_chart(df, peak_threshold=None, peak_shaving_capacity_per
             line_dash="dash",
             line_color="#E41A1C",
             line_width=2,
-            annotation_text=f"Schwellenwert für Peakshaving nicht optimal. Spitzenlast: {df_sorted["grid_import_kw"].max():.0f} kW, Zielwert: {peak_threshold:.0f} kW",
+            annotation_text=f"Schwellenwert für Peakshaving nicht optimal. Spitzenlast: {df_sorted['grid_import_kw'].max():.0f} kW, Zielwert: {peak_threshold:.0f} kW",
             annotation_position="top left",
             annotation=dict(
                 font=dict(size=12, color="red"),
@@ -1024,7 +819,7 @@ def create_load_profile_chart(df, peak_threshold=None, peak_shaving_capacity_per
     fig.add_annotation(
         x=df_sorted['timestamp'].iloc[len(df_sorted)//2],
         y=peak_threshold+30,
-        text=f"Eingesparte Lastspitze: {df["net_load_kw"].max() - df["grid_import_kw"].max():.0f} kW",
+        text=f"Eingesparte Lastspitze: {df['net_load_kw'].max() - df['grid_import_kw'].max():.0f} kW",
         showarrow=False,
         bgcolor="white",
         bordercolor="red",
@@ -1082,7 +877,7 @@ def create_load_profile_chart_2(df, peak_threshold=None, soc_col=None,
                               savings_eur=None, original_peak=None, reduced_peak=None):
     """Create a professional 2-panel visualization for load + battery behavior."""
     # Show progress indicator for large datasets
-    if len(df) > 10000:
+    if len(df) > MIN_POINTS_FOR_RESAMPLING:
         st.info(f"🔄 Rendering 2-panel chart with {len(df):,} data points...")
 
     df_sorted = df.sort_values('timestamp').reset_index(drop=True)
@@ -1454,9 +1249,9 @@ def create_info_box(power_rating, capacity):
 def create_load_stats_box(df):
     """Create an information box showing load profile statistics."""
     # Calculate statistics
-    total_consumption_no_battery = df['net_load_kw'].sum() * 0.25  # Convert to kWh
+    total_consumption_no_battery = df['net_load_kw'].sum() * INTERVAL_HOURS  # Convert to kWh
     peak_load_no_battery = df['net_load_kw'].max()
-    total_grid_consumption_with_battery = df['grid_import_kw'].sum() * 0.25  # Convert to kWh
+    total_grid_consumption_with_battery = df['grid_import_kw'].sum() * INTERVAL_HOURS  # Convert to kWh
     peak_load_with_battery = df['grid_import_kw'].max()
     
     # Calculate reductions for summary
@@ -1475,17 +1270,17 @@ def create_cost_box(df, demand_charge_high=DEMAND_CHARGE_HIGH, demand_charge_low
     """Create an information box showing cost analysis comparison."""
     
     # === CASE 4: With Battery ===
-    energy_cost_case_4 = (df['grid_import_kw'] * 0.25 * df['price']).sum()
+    energy_cost_case_4 = (df['grid_import_kw'] * INTERVAL_HOURS * df['price']).sum()
     
     # Calculate separate revenue streams
-    energy_revenue_pv_case_4 = (df['grid_export_pv_kw'] * 0.25 * df['price'] * EXPORT_REVENUE_FACTOR).sum()
+    energy_revenue_pv_case_4 = (df['grid_export_pv_kw'] * INTERVAL_HOURS * df['price'] * EXPORT_REVENUE_FACTOR).sum()
     # Arbitrage benefit = avoided grid import costs (not revenue from export)
-    arbitrage_import_cost_saved = (df['grid_import_avoided_arbitrage_kw'] * 0.25 * df['price']).sum()
+    arbitrage_import_cost_saved = (df['grid_import_avoided_arbitrage_kw'] * INTERVAL_HOURS * df['price']).sum()
     energy_revenue_case_4 = energy_revenue_pv_case_4  # Only PV actually generates revenue
     
     # Calculate demand charge Case 4
     peak_load_case_4 = df['grid_import_kw'].max()
-    total_energy_imported_case_4 = (df['grid_import_kw'] * 0.25).sum()
+    total_energy_imported_case_4 = (df['grid_import_kw'] * INTERVAL_HOURS).sum()
     
 
     volllaststunden_case_4 = total_energy_imported_case_4 / peak_load_case_4 if peak_load_case_4 > 0 else 0
@@ -1496,15 +1291,15 @@ def create_cost_box(df, demand_charge_high=DEMAND_CHARGE_HIGH, demand_charge_low
     
     # === CASE 1: Without Battery (Original Load) ===
     # Use original load and net_load_kw (which is load after PV)
-    energy_cost_case_1 = ((df['net_load_kw'].clip(lower=0)) * 0.25 * df['price']).sum()  # Only positive net load (consumption)
+    energy_cost_case_1 = ((df['net_load_kw'].clip(lower=0)) * INTERVAL_HOURS * df['price']).sum()  # Only positive net load (consumption)
     
     # Calculate revenue from PV surplus (when net_load_kw < 0)
-    pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * 0.25, 0)  # Only negative net load
+    pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * INTERVAL_HOURS, 0)  # Only negative net load
     energy_revenue_case_1 = (pv_surplus * df['price'] * EXPORT_REVENUE_FACTOR).sum()
     
     # Calculate demand charge Case 1 - based on original peak load
     peak_load_case_1 = df['net_load_kw'].max()
-    total_energy_case_1 = (df['net_load_kw'] * 0.25).sum()
+    total_energy_case_1 = (df['net_load_kw'] * INTERVAL_HOURS).sum()
     volllaststunden_case_1 = total_energy_case_1 / peak_load_case_1 if peak_load_case_1 > 0 else 0
     demand_charge_rate_case_1 = demand_charge_high if volllaststunden_case_1 >= VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
     demand_cost_case_1 = peak_load_case_1 * demand_charge_rate_case_1
@@ -1553,17 +1348,17 @@ def create_financial_value_box(df, power_rating, capacity, demand_charge_high=DE
     
     # 2. Calculate Annual Savings (from existing cost analysis)
     # === CASE 4: With Battery ===
-    energy_cost_case_4 = (df['grid_import_kw'] * 0.25 * df['price']).sum()
+    energy_cost_case_4 = (df['grid_import_kw'] * INTERVAL_HOURS * df['price']).sum()
     
     # Calculate separate revenue streams
-    energy_revenue_pv_case_4 = (df['grid_export_pv_kw'] * 0.25 * df['price'] * EXPORT_REVENUE_FACTOR).sum()
+    energy_revenue_pv_case_4 = (df['grid_export_pv_kw'] * INTERVAL_HOURS * df['price'] * EXPORT_REVENUE_FACTOR).sum()
     # Arbitrage benefit = avoided grid import costs (not revenue from export)
-    arbitrage_import_cost_saved = (df['grid_import_avoided_arbitrage_kw'] * 0.25 * df['price']).sum()
+    arbitrage_import_cost_saved = (df['grid_import_avoided_arbitrage_kw'] * INTERVAL_HOURS * df['price']).sum()
     energy_revenue_case_4 = energy_revenue_pv_case_4  # Only PV actually generates revenue
     
     # Calculate demand charge Case 4
     peak_load_case_4 = df['grid_import_kw'].max()
-    total_energy_imported_case_4 = (df['grid_import_kw'] * 0.25).sum()
+    total_energy_imported_case_4 = (df['grid_import_kw'] * INTERVAL_HOURS).sum()
     volllaststunden_case_4 = total_energy_imported_case_4 / peak_load_case_4 if peak_load_case_4 > 0 else 0
     demand_charge_rate_case_4 = demand_charge_high if volllaststunden_case_4 >= VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
     demand_cost_case_4 = peak_load_case_4 * demand_charge_rate_case_4
@@ -1572,15 +1367,15 @@ def create_financial_value_box(df, power_rating, capacity, demand_charge_high=DE
     
     # === CASE 1: Without Battery ===
     # Use original load and net_load_kw (which is load after PV)
-    energy_cost_case_1 = ((df['net_load_kw'].clip(lower=0)) * 0.25 * df['price']).sum()  # Only positive net load (consumption)
+    energy_cost_case_1 = ((df['net_load_kw'].clip(lower=0)) * INTERVAL_HOURS * df['price']).sum()  # Only positive net load (consumption)
     
     # Calculate revenue from PV surplus (when net_load_kw < 0)
-    pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * 0.25, 0)  # Only negative net load
+    pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * INTERVAL_HOURS, 0)  # Only negative net load
     energy_revenue_case_1 = (pv_surplus * df['price'] * EXPORT_REVENUE_FACTOR).sum()
     
     # Calculate demand charge Case 1 - based on original peak load
     peak_load_case_1 = df['net_load_kw'].max()
-    total_energy_case_1 = (df['net_load_kw'] * 0.25).sum()
+    total_energy_case_1 = (df['net_load_kw'] * INTERVAL_HOURS).sum()
     volllaststunden_case_1 = total_energy_case_1 / peak_load_case_1 if peak_load_case_1 > 0 else 0
     demand_charge_rate_case_1 = demand_charge_high if volllaststunden_case_1 >= VOLLLASTSTUNDEN_THRESHOLD else demand_charge_low
     demand_cost_case_1 = peak_load_case_1 * demand_charge_rate_case_1
@@ -1615,8 +1410,8 @@ def create_financial_value_box(df, power_rating, capacity, demand_charge_high=DE
     # 4. Arbitrage Benefit (charging at low prices, discharging at high prices)
     # Calculate when battery was used for arbitrage (not peak shaving)
     # Arbitrage benefit = difference in costs when battery actively trades energy
-    battery_charge_cost = (df['battery_charge_kw'] * 0.25 * df['price']).sum()
-    battery_discharge_revenue = (df['battery_discharge_kw'] * 0.25 * df['price'] * EXPORT_REVENUE_FACTOR).sum()
+    battery_charge_cost = (df['battery_charge_kw'] * INTERVAL_HOURS * df['price']).sum()
+    battery_discharge_revenue = (df['battery_discharge_kw'] * INTERVAL_HOURS * df['price'] * EXPORT_REVENUE_FACTOR).sum()
     arbitrage_benefit = battery_discharge_revenue - battery_charge_cost
     
     # 5. PV Self-Consumption Optimization Benefit
@@ -1624,7 +1419,7 @@ def create_financial_value_box(df, power_rating, capacity, demand_charge_high=DE
     # This is the difference between what we would have earned from export vs. what we save by using stored energy
     
     # PV surplus that gets stored in battery (when net_load_kw < 0 and battery charges)
-    pv_stored_in_battery = df[df['net_load_kw'] < 0]['battery_charge_kw'].sum() * 0.25  # kWh
+    pv_stored_in_battery = df[df['net_load_kw'] < 0]['battery_charge_kw'].sum() * INTERVAL_HOURS  # kWh
     
     # Calculate what we would have earned from exporting this energy
     # Use average export price for the periods when PV was generating surplus
@@ -1846,21 +1641,21 @@ def main():
     # Demand charge configuration
     st.sidebar.subheader("💶 Netzentgelte (Leistungspreis)")
     demand_charge_high = st.sidebar.number_input(
-        "Leistungspreis >= 2500 VLH (€/kW):",
+        f"Leistungspreis >= {VOLLLASTSTUNDEN_THRESHOLD} VLH (€/kW):",
         min_value=0.0,
         max_value=500.0,
         value=float(DEMAND_CHARGE_HIGH),
         step=1.0,
-        help="Leistungspreis bei >= 2500 Volllaststunden"
+        help=f"Leistungspreis bei >= {VOLLLASTSTUNDEN_THRESHOLD} Volllaststunden"
     )
     
     demand_charge_low = st.sidebar.number_input(
-        "Leistungspreis < 2500 VLH (€/kW):",
+        f"Leistungspreis < {VOLLLASTSTUNDEN_THRESHOLD} VLH (€/kW):",
         min_value=0.0,
         max_value=500.0,
         value=float(DEMAND_CHARGE_LOW),
         step=1.0,
-        help="Leistungspreis bei < 2500 Volllaststunden"
+        help=f"Leistungspreis bei < {VOLLLASTSTUNDEN_THRESHOLD} Volllaststunden"
     )
     
     # Price boundary configuration
@@ -1878,7 +1673,7 @@ def main():
         "Niedrigpreis-Perzentil (%):",
         min_value=1,
         max_value=50,
-        value=40,
+        value=LOW_PRICE_PERCENTILE,
         step=1,
         help="Perzentil für den unteren Preisschwellenwert (Batterie lädt unterhalb)"
     )
@@ -1887,7 +1682,7 @@ def main():
         "Hochpreis-Perzentil (%):",
         min_value=51,
         max_value=99,
-        value=60,
+        value=HIGH_PRICE_PERCENTILE,
         step=1,
         help="Perzentil für den oberen Preisschwellenwert (Batterie entlädt oberhalb)"
     )
@@ -1987,12 +1782,12 @@ def main():
         st.subheader(f"📊 Ergebnisse für: `{filename}` | 💰 Preisdaten: {used_price_year}")
         
         # Calculate the values directly here as fallback
-        energy_cost_case_4 = (df['grid_import_kw'] * 0.25 * df['price']).sum()
-        energy_revenue_case_4 = (df['grid_export_kw'] * 0.25 * df['price'] * EXPORT_REVENUE_FACTOR).sum()
+        energy_cost_case_4 = (df['grid_import_kw'] * INTERVAL_HOURS * df['price']).sum()
+        energy_revenue_case_4 = (df['grid_export_kw'] * INTERVAL_HOURS * df['price'] * EXPORT_REVENUE_FACTOR).sum()
         peak_load_case_4 = df['grid_import_kw'].max()
         
-        energy_cost_case_1 = (df['net_load_kw'].clip(lower=0) * 0.25 * df['price']).sum()
-        pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * 0.25, 0)
+        energy_cost_case_1 = (df['net_load_kw'].clip(lower=0) * INTERVAL_HOURS * df['price']).sum()
+        pv_surplus = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * INTERVAL_HOURS, 0)
         energy_revenue_case_1 = (pv_surplus * df['price'] * EXPORT_REVENUE_FACTOR).sum()
         peak_load_case_1 = df['net_load_kw'].max()
 
@@ -2062,7 +1857,7 @@ def main():
             # Enhanced KPI Box with Battery and PV metrics
             if not df.empty:
                 # Battery calculations
-                total_energy_charged = df['battery_charge_kw'].sum() * 0.25  # Convert to kWh
+                total_energy_charged = df['battery_charge_kw'].sum() * INTERVAL_HOURS  # Convert to kWh
                 battery_cycles = total_energy_charged / cap if cap > 0 else 0
                 
                 # Get PV capacity from session state
@@ -2074,7 +1869,7 @@ def main():
                 has_pv_data = (pv_cap_kwp > 0 or custom_pv_file is not None) and 'yearly_production_kw' in df.columns
                 if has_pv_data:
                     # Total PV generation
-                    total_pv_generation_kwh = df['yearly_production_kw'].sum() * 0.25
+                    total_pv_generation_kwh = df['yearly_production_kw'].sum() * INTERVAL_HOURS
                     
                     # Peak PV generation
                     peak_pv_generation_kw = df['yearly_production_kw'].max()
@@ -2091,13 +1886,13 @@ def main():
                     
                     # PV utilization - what percentage of theoretical maximum was actually generated
                     # Theoretical max = capacity * hours in year * capacity factor (assume ~11% for Germany)
-                    hours_in_year = len(df) * 0.25  # 15-min intervals
+                    hours_in_year = len(df) * INTERVAL_HOURS  # 15-min intervals
                     theoretical_max_kwh = estimated_pv_cap_kwp * hours_in_year
                     pv_capacity_factor = (total_pv_generation_kwh / theoretical_max_kwh * 100) if theoretical_max_kwh > 0 else 0
                     
                     # Self-consumption ratio - how much PV was used directly vs exported
                     # PV surplus exported = when net_load_kw < 0
-                    pv_surplus_exported = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * 0.25, 0).sum()
+                    pv_surplus_exported = np.where(df['net_load_kw'] < 0, -df['net_load_kw'] * INTERVAL_HOURS, 0).sum()
                     self_consumption_kwh = total_pv_generation_kwh - pv_surplus_exported
                     self_consumption_ratio = (self_consumption_kwh / total_pv_generation_kwh * 100) if total_pv_generation_kwh > 0 else 0
                     
@@ -2106,12 +1901,12 @@ def main():
                     if 'battery_charge_kw' in df.columns:
                         # Estimate PV charging by looking at periods when net_load < 0 and battery is charging
                         pv_charging_periods = (df['net_load_kw'] < 0) & (df['battery_charge_kw'] > 0)
-                        pv_stored_in_battery = df[pv_charging_periods]['battery_charge_kw'].sum() * 0.25
+                        pv_stored_in_battery = df[pv_charging_periods]['battery_charge_kw'].sum() * INTERVAL_HOURS
                     
                     battery_storage_ratio = (pv_stored_in_battery / total_pv_generation_kwh * 100) if total_pv_generation_kwh > 0 else 0
                     
                     # Autarkie-Grad (energy independence) - how much of total consumption was covered by PV
-                    total_consumption_kwh = df['load_org'].sum() * 0.25
+                    total_consumption_kwh = df['load_org'].sum() * INTERVAL_HOURS
                     autarkie_grad = (self_consumption_kwh / total_consumption_kwh * 100) if total_consumption_kwh > 0 else 0
                     
                     # Full utilization hours (Volllaststunden)
@@ -2174,14 +1969,14 @@ def main():
                     avg_cost_without_battery = (df['net_load_kwh'] * df['price']).sum() / ((df['net_load_kwh']).sum() + 0.0001)  # Avoid division by zero
                     
                     # With battery: grid_import_kw (actual grid consumption with battery)
-                    total_grid_consumption = df['grid_import_kw'].sum() * 0.25
+                    total_grid_consumption = df['grid_import_kw'].sum() * INTERVAL_HOURS
                     if total_grid_consumption > 0:
-                        avg_cost_with_battery = (df['grid_import_kw'] * 0.25 * df['price']).sum() / total_grid_consumption
+                        avg_cost_with_battery = (df['grid_import_kw'] * INTERVAL_HOURS * df['price']).sum() / total_grid_consumption
                     else:
                         avg_cost_with_battery = 0
 
                     full_load_hours_without_battery = df['net_load_kwh'].sum() / df['net_load_kw'].max()
-                    full_load_hours_with_battery = df['grid_import_kw'].sum() *0.25 / df['grid_import_kw'].max()
+                    full_load_hours_with_battery = df['grid_import_kw'].sum() * INTERVAL_HOURS / df['grid_import_kw'].max()
 
                     # Create styled price statistics box
                     price_box = f"""
@@ -2247,8 +2042,8 @@ def main():
         
         # Add legend for price chart outside the chart
         # Get current percentile values from session state
-        low_perc = st.session_state.get('low_price_percentile', 30)
-        high_perc = st.session_state.get('high_price_percentile', 70)
+        low_perc = st.session_state.get('low_price_percentile', LOW_PRICE_PERCENTILE)
+        high_perc = st.session_state.get('high_price_percentile', HIGH_PRICE_PERCENTILE)
         
         st.markdown(f"""
         **Strompreis-Diagramm Legende:**
