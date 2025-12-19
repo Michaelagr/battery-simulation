@@ -17,6 +17,7 @@ from src.config import (
     DEMAND_CHARGE_LOW
 )
 from src.data.processors import handle_german_dst_transitions
+from src.battery.simulators import battery_simulation_ps
 
 
 # Streamlit config
@@ -71,77 +72,8 @@ battery_configs = {
 
 # -------------------- Helper functions --------------------------
 
-### Peak Shaving Simulation
-def peak_shaving(load_data, threshold):
-    peak_threshold = max(load_data) * (threshold / 100)
-    optimized_load = np.where(load_data > peak_threshold, peak_threshold, load_data)
-    return optimized_load
+### Battery Simulation Functions
 
-####
-def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, depth_of_discharge, battery_efficiency):
-    #"""
-    #Peak shaving battery simulation function
-    #"""
-    total_capacity = battery_capacity  # kWh
-    reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
-    soc = total_capacity  # start fully charged in kWh
-    interval_hours = INTERVAL_HOURS
-
-    threshold_kw = df["net_load_kw"].max() - threshold_kw
-
-    optimized = []
-    charge = []
-    discharge = []
-    soc_state = []
-
-    for load in df["net_load_kw"]:
-        grid_load = load  # start with original load
-
-        # --- DISCHARGING ---
-        if load > threshold_kw and soc > reserve_energy:
-            power_needed = load - threshold_kw
-            max_discharge_power = (soc - reserve_energy) / interval_hours
-            actual_discharge_power = min(power_rating, power_needed, max_discharge_power)
-
-            energy_used = actual_discharge_power * interval_hours / battery_efficiency
-            # energy_used = actual_discharge_power * interval_hours / 1
-            soc = soc - energy_used
-
-            grid_load = load - actual_discharge_power
-            charge.append(0)
-            discharge.append(actual_discharge_power)
-
-        # --- CHARGING (only when load is below threshold to avoid peak increase) ---
-        elif load <= threshold_kw and soc < total_capacity:
-
-            max_possible_charge = threshold_kw - load  # Determine max possible charge power without exceeding the threshold
-
-            max_charge_power = (total_capacity - soc) / interval_hours
-            actual_charge_power = min(power_rating, max_charge_power, max_possible_charge)
-
-            energy_stored = actual_charge_power * interval_hours * battery_efficiency
-            soc = min(soc + energy_stored, total_capacity)
-
-            grid_load = load + actual_charge_power
-            charge.append(actual_charge_power)
-            discharge.append(0)
-
-        else:
-            charge.append(0)
-            discharge.append(0)
-
-        optimized.append(grid_load)
-        soc_state.append(soc)
-
-    df["ps_grid_load"] = optimized
-    df["battery_charge"] = charge
-    df["battery_discharge"] = discharge
-    df["battery_soc"] = soc_state
-    return df
-
-
-
-### New battery simulation
 def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     total_capacity = battery_capacity  # kWh
     reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 20%) in kWh
@@ -199,7 +131,6 @@ def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharg
     df["battery_discharge"] = discharge
     df["battery_soc"] = soc_state
     return df
-
 
 def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     """
@@ -272,9 +203,6 @@ def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_dis
     df["battery_discharge"] = discharge
     df["battery_soc"] = soc_state
     return df
-
-
-
 
 ### New battery simulation
 def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
@@ -495,7 +423,6 @@ def battery_simulation_vpv_selfconsumption_oldf(df, battery_capacity, power_rati
     df["pv_rich"] = df['pv_rich']
     return df
 
-
 def optimize_battery_params(df, battery_capacity, power_rating, demand_charge_low, demand_charge_high, energy_charge_low, energy_charge_high):
     best_roi = -float('inf')
     best_params = {}
@@ -544,7 +471,6 @@ def calculate_roi(df, demand_charge, energy_charge):
 
     return savings_total
 
-
 def optimize_battery_params_working(df, battery_capacity, power_rating, demand_charge_low, demand_charge_high, energy_charge_low, energy_charge_high):
     best_roi = -float('inf')
     best_params = {}
@@ -578,7 +504,6 @@ def optimize_battery_params_working(df, battery_capacity, power_rating, demand_c
                 }
 
     return best_params
-
 
 def battery_simulation_vpv_selfconsumption_working(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY, reserve_fraction=0.1):
     ################### ELAS CHANGES ###############
@@ -745,7 +670,6 @@ def battery_simulation_vpv_selfconsumption_working(df, battery_capacity, power_r
     df["pv_rich"] = df['pv_rich']
     df["soc_reserve"] = soc_reserve_state
     return df
-
 
 def battery_simulation_vpv_selfconsumption(
     df,
@@ -933,7 +857,6 @@ def battery_simulation_vpv_selfconsumption(
     df["reserve_fraction_dynamic"] = df['reserve_fraction_dynamic']
 
     return df
-
 
 def battery_simulation_ps_with_pv(df, load_series, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
     total_capacity = battery_capacity  # kWh
@@ -1831,65 +1754,10 @@ with taboptimierer:
                     
                     # Prepare numpy array for faster processing
                     load_array = df["load"].values  # Convert to numpy array
+                    load_df_base = pd.DataFrame({"net_load_kw": load_array})
                     peak_load_org = load_array.max()
                     peak_load = peak_load_org  # Match original variable name from your attached selection
                     total_consumption_optimizer = load_array.sum() / 4
-                    
-                    # EXACT COPY of battery_simulation_ps but using numpy arrays for speed
-                    def battery_simulation_ps_numpy(load_data, battery_capacity, power_rating, threshold_kw, depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE, battery_efficiency=BATTERY_EFFICIENCY):
-                        # EXACT ORIGINAL LOGIC
-                        total_capacity = battery_capacity  # kWh
-                        reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
-                        soc = total_capacity  # start fully charged in kWh
-                        interval_hours = INTERVAL_HOURS
-                        
-                        threshold_kw = load_data.max() - threshold_kw
-                        
-                        optimized = []
-                        charge = []
-                        discharge = []
-                        soc_state = []
-                        
-                        for load in load_data:
-                            grid_load = load  # start with original load
-                            
-                            # --- DISCHARGING --- (EXACT ORIGINAL)
-                            if load > threshold_kw and soc > reserve_energy:
-                                power_needed = load - threshold_kw
-                                max_discharge_power = (soc - reserve_energy) / interval_hours
-                                actual_discharge_power = min(power_rating, power_needed, max_discharge_power)
-                                
-                                energy_used = actual_discharge_power * interval_hours / battery_efficiency
-                                # energy_used = actual_discharge_power * interval_hours / 1
-                                soc = soc - energy_used
-                                
-                                grid_load = load - actual_discharge_power
-                                charge.append(0)
-                                discharge.append(actual_discharge_power)
-                                
-                            # --- CHARGING (only when load is below threshold to avoid peak increase) --- (EXACT ORIGINAL)
-                            elif load <= threshold_kw and soc < total_capacity:
-                                
-                                max_possible_charge = threshold_kw - load  # Determine max possible charge power without exceeding the threshold
-                                
-                                max_charge_power = (total_capacity - soc) / interval_hours
-                                actual_charge_power = min(power_rating, max_charge_power, max_possible_charge)
-                                
-                                energy_stored = actual_charge_power * interval_hours * battery_efficiency
-                                soc = min(soc + energy_stored, total_capacity)
-                                
-                                grid_load = load + actual_charge_power
-                                charge.append(actual_charge_power)
-                                discharge.append(0)
-                                
-                            else:
-                                charge.append(0)
-                                discharge.append(0)
-                            
-                            optimized.append(grid_load)
-                            soc_state.append(soc)
-                        
-                        return np.array(optimized)
                     
                     # === ORIGINAL PEAK SHAVING OPTIMIZATION ===
                     # Test different peak reduction values - EXACT ORIGINAL
@@ -1903,11 +1771,16 @@ with taboptimierer:
                     best_threshold_ps_only = 0
                     
                     for ps_reduction_value in reduction_values_ps:
-                        # Run numpy-based battery simulation
-                        optimized_load = battery_simulation_ps_numpy(
-                            load_array, opt_battery_capacity_kwh, opt_battery_power_kw, 
-                            threshold_kw=ps_reduction_value, depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE, battery_efficiency=BATTERY_EFFICIENCY
+                        # Run shared peak-shaving simulation
+                        df_ps = battery_simulation_ps(
+                            load_df_base.copy(),
+                            opt_battery_capacity_kwh,
+                            opt_battery_power_kw,
+                            threshold_kw=ps_reduction_value,
+                            depth_of_discharge=DEFAULT_DEPTH_OF_DISCHARGE,
+                            battery_efficiency=BATTERY_EFFICIENCY
                         )
+                        optimized_load = df_ps["ps_grid_load"].to_numpy()
                         
                         # Calculate results after peak shaving
                         peak_after_ps = optimized_load.max()

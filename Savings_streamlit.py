@@ -26,73 +26,13 @@ from src.config import (
     INTERVAL_HOURS
 )
 from src.data.loaders import read_price_data, read_load_profile, load_solar_data
+from src.battery.simulators import battery_simulation_ps
 
 # Legacy constants for backward compatibility (can be removed later)
 PV_CAPACITY_KWP = 0
 DEBUG = 0
 
 # === EXTRACTED FUNCTIONS FROM ORIGINAL FILE ===
-
-def battery_simulation_ps(df, battery_capacity, power_rating, threshold_kw, depth_of_discharge, battery_efficiency):
-    """
-    Peak shaving battery simulation function
-    """
-    total_capacity = battery_capacity  # kWh
-    reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 10%) in kWh
-    soc = total_capacity  # start fully charged in kWh
-    interval_hours = INTERVAL_HOURS  # 15-minute intervals
-
-    threshold_kw = df["net_load_kw"].max() - threshold_kw
-
-    optimized = []
-    charge = []
-    discharge = []
-    soc_state = []
-
-    for load in df["net_load_kw"]:
-        grid_load = load  # start with original load
-
-        # --- DISCHARGING ---
-        if load > threshold_kw and soc > reserve_energy:
-            power_needed = load - threshold_kw
-            max_discharge_power = (soc - reserve_energy) / interval_hours
-            actual_discharge_power = min(power_rating, power_needed, max_discharge_power)
-
-            energy_used = actual_discharge_power * interval_hours / battery_efficiency
-            # energy_used = actual_discharge_power * interval_hours / 1
-            soc = soc - energy_used
-
-            grid_load = load - actual_discharge_power
-            charge.append(0)
-            discharge.append(actual_discharge_power)
-
-        # --- CHARGING (only when load is below threshold to avoid peak increase) ---
-        elif load <= threshold_kw and soc < total_capacity:
-
-            max_possible_charge = threshold_kw - load  # Determine max possible charge power without exceeding the threshold
-
-            max_charge_power = (total_capacity - soc) / interval_hours
-            actual_charge_power = min(power_rating, max_charge_power, max_possible_charge)
-
-            energy_stored = actual_charge_power * interval_hours * battery_efficiency
-            soc = min(soc + energy_stored, total_capacity)
-
-            grid_load = load + actual_charge_power
-            charge.append(actual_charge_power)
-            discharge.append(0)
-
-        else:
-            charge.append(0)
-            discharge.append(0)
-
-        optimized.append(grid_load)
-        soc_state.append(soc)
-
-    df["ps_grid_load"] = optimized
-    df["battery_charge"] = charge
-    df["battery_discharge"] = discharge
-    df["battery_soc"] = soc_state
-    return df
 
 def rolling_quantile(arr, window, q):
     """Calculate rolling quantile for price analysis"""
