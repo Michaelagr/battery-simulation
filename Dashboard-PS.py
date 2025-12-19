@@ -1,12 +1,13 @@
+import locale
+import datetime
+
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
-import locale
-import datetime
-#import test_daily_load
+from numba import njit
+
 
 from src.config import (
     INTERVAL_HOURS,
@@ -17,7 +18,8 @@ from src.config import (
     DEMAND_CHARGE_LOW
 )
 from src.data.processors import handle_german_dst_transitions
-from src.battery.simulators import battery_simulation_ps
+from src.battery.simulators import (battery_simulation_ps, battery_simulation_v02, 
+                                     battery_simulation_hlz_only, battery_simulation_vpv_selfconsumption_working)
 
 
 # Streamlit config
@@ -73,136 +75,7 @@ battery_configs = {
 # -------------------- Helper functions --------------------------
 
 ### Battery Simulation Functions
-
-def battery_simulation_v02(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
-    total_capacity = battery_capacity  # kWh
-    reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC (e.g., 20%) in kWh
-    soc = total_capacity  # start fully charged in kWh
-    interval_hours = INTERVAL_HOURS
-    peak = df["load"].max()
-    threshold_kw = peak * (threshold_pct / 100)
-
-    optimized = []
-    charge = []
-    discharge = []
-    soc_state = []
-
-    for load in df["load"]:
-        grid_load = load  # start with original load
-
-        # --- DISCHARGING ---
-        if load > threshold_kw and soc > reserve_energy:
-            power_needed = load - threshold_kw
-            max_discharge_power = (soc - reserve_energy) / interval_hours
-            actual_discharge_power = min(power_rating, power_needed, max_discharge_power)
-
-            energy_used = actual_discharge_power * interval_hours / battery_efficiency
-            # soc = max(soc - energy_used, reserve_energy)
-            soc = soc - energy_used
-
-            grid_load = load - actual_discharge_power
-            charge.append(0)
-            discharge.append(actual_discharge_power)
-
-        # --- CHARGING (only when load is below threshold to avoid peak increase) ---
-        elif load <= threshold_kw and soc < total_capacity:
-
-            max_possible_charge = threshold_kw - load  # Determine max possible charge power without exceeding the threshold
-
-            max_charge_power = (total_capacity - soc) / interval_hours
-            actual_charge_power = min(power_rating, max_charge_power, max_possible_charge)
-
-            energy_stored = actual_charge_power * interval_hours * battery_efficiency
-            soc = min(soc + energy_stored, total_capacity)
-
-            grid_load = load + actual_charge_power
-            charge.append(actual_charge_power)
-            discharge.append(0)
-
-        else:
-            charge.append(0)
-            discharge.append(0)
-
-        optimized.append(grid_load)
-        soc_state.append(soc)
-
-    df["grid_load"] = optimized
-    df["battery_charge"] = charge
-    df["battery_discharge"] = discharge
-    df["battery_soc"] = soc_state
-    return df
-
-def battery_simulation_hlz_only(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
-    """
-    Battery simulation that only operates during HLZ (Hochlastzeitfenster) windows.
-    The battery only charges/discharges when 'in_window' is True.
-    """
-    total_capacity = battery_capacity  # kWh
-    reserve_energy = total_capacity * (1 - depth_of_discharge / 100)  # minimum SoC in kWh
-    soc = total_capacity  # start fully charged in kWh
-    interval_hours = INTERVAL_HOURS
-    
-    # Calculate threshold based on peak in HLZ windows only
-    hlz_data = df[df['in_window']]
-    if len(hlz_data) > 0:
-        peak_hlz = hlz_data["load"].max()
-        threshold_kw = peak_hlz * (threshold_pct / 100)
-    else:
-        threshold_kw = df["load"].max() * (threshold_pct / 100)  # Fallback
-
-    optimized = []
-    charge = []
-    discharge = []
-    soc_state = []
-
-    for i, (load, in_window) in enumerate(zip(df["load"], df["in_window"])):
-        grid_load = load  # start with original load
-
-        # Only operate battery during HLZ windows
-        if in_window:
-            # --- DISCHARGING ---
-            if load > threshold_kw and soc > reserve_energy:
-                power_needed = load - threshold_kw
-                max_discharge_power = (soc - reserve_energy) / interval_hours
-                actual_discharge_power = min(power_rating, power_needed, max_discharge_power)
-
-                energy_used = actual_discharge_power * interval_hours / battery_efficiency
-                soc = soc - energy_used
-
-                grid_load = load - actual_discharge_power
-                charge.append(0)
-                discharge.append(actual_discharge_power)
-
-            # --- CHARGING (only when load is below threshold to avoid peak increase) ---
-            elif load <= threshold_kw and soc < total_capacity:
-                max_possible_charge = threshold_kw - load  # Max charge without exceeding threshold
-
-                max_charge_power = (total_capacity - soc) / interval_hours
-                actual_charge_power = min(power_rating, max_charge_power, max_possible_charge)
-
-                energy_stored = actual_charge_power * interval_hours * battery_efficiency
-                soc = min(soc + energy_stored, total_capacity)
-
-                grid_load = load + actual_charge_power
-                charge.append(actual_charge_power)
-                discharge.append(0)
-
-            else:
-                charge.append(0)
-                discharge.append(0)
-        else:
-            # Outside HLZ windows: battery is inactive
-            charge.append(0)
-            discharge.append(0)
-
-        optimized.append(grid_load)
-        soc_state.append(soc)
-
-    df["grid_load"] = optimized
-    df["battery_charge"] = charge
-    df["battery_discharge"] = discharge
-    df["battery_soc"] = soc_state
-    return df
+# Note: Core simulation functions moved to src/battery/simulators.py for better organization
 
 ### New battery simulation
 def battery_simulation_vpv(df, battery_capacity, power_rating, depth_of_discharge, threshold_pct, battery_efficiency=BATTERY_EFFICIENCY):
@@ -1301,7 +1174,7 @@ with ((tab_analyse)):
                                    labels={"timestamp": "Zeit", "load": "Last (kW)"}
                                          )
             fig_overview_gesamt.update_layout(height=400, xaxis_title="Zeit")
-            st.plotly_chart(fig_overview_gesamt, use_container_width=True, config=plotly_config)
+            st.plotly_chart(fig_overview_gesamt, width='stretch', config=plotly_config)
 
 
         with tab_solar:
@@ -1404,7 +1277,7 @@ with ((tab_analyse)):
                     with col5_pv:
                         st.metric("Autarkiegrad", f"{(df['load'].sum() - (positive_load_pv.sum()))/(df['load'].sum() )*100:,.0f} %", help="Anteil des Gesamtverbrauchs, der durch PV gedeckt wurde")
 
-                st.plotly_chart(fig_pv, use_container_width=True, config=plotly_config)
+                st.plotly_chart(fig_pv, width='stretch', config=plotly_config)
 
 
         with tab_toppeaks:
@@ -1434,7 +1307,7 @@ with ((tab_analyse)):
                                    title=f"📊 Übersicht der {n_peaks} höchsten Spitzenlasten",
                                    labels={"load": "Last (kW)", "timestamp": "Zeit"})
                 fig_top20.update_layout(xaxis_tickformat="%b",xaxis_title=f"{year}", xaxis_tickangle=-45, xaxis=dict(nticks=20, range=[start, end]))
-                st.plotly_chart(fig_top20, use_container_width=True)
+                st.plotly_chart(fig_top20, width='stretch')
 
 
             ################### +++++++++++++++++++++++++++++SUN+++++++++++++++++++++++++++++ ###################
@@ -1460,7 +1333,7 @@ with ((tab_analyse)):
                                        title=f"📊 Übersicht der {n_peaks} höchsten Spitzenlasten",
                                        labels={"load_pv": "Last (kW)", "Timestamp": "Time"})
                     fig_top20_pv.update_layout(xaxis_tickformat="%b",xaxis_title=f"{year}", xaxis_tickangle=-45, xaxis=dict(nticks=20, range=[start, end]))
-                    st.plotly_chart(fig_top20_pv, use_container_width=True)
+                    st.plotly_chart(fig_top20_pv, width='stretch')
 
 
                 st.header("")
@@ -1522,7 +1395,7 @@ with ((tab_analyse)):
                         xaxis=dict(nticks=20, range=[start, end])
                     )
 
-                    st.plotly_chart(fig_combined, use_container_width=True)
+                    st.plotly_chart(fig_combined, width='stretch')
 
 
             st.header("🔍 Detail-Analyse der Spitzenlasten")
@@ -1571,14 +1444,14 @@ with ((tab_analyse)):
                 df_day = df_peaks[df_peaks["timestamp"].dt.date == selected_day]
                 fig_day = px.line(df_day, x="timestamp", y="load", title=f"🔋 Lastkurve am ausgewählten Tag ({selected_day})")
                 fig_day.update_layout(height=500, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig_day, use_container_width=True)
+                st.plotly_chart(fig_day, width='stretch')
 
         with tab_loadduration:
             st.subheader("📉 Lastdauerkurve")
             sorted_loads = df_peaks["load"].sort_values(ascending=False).reset_index(drop=True)
             fig_load_duration = px.line(sorted_loads, title="🔺 Lastdauerkurve (ohne PV)")
             fig_load_duration.update_layout(yaxis_title="Last (kW)", xaxis_title="Anzahl Stunden (sortiert nach Last)")
-            st.plotly_chart(fig_load_duration, use_container_width=True)
+            st.plotly_chart(fig_load_duration, width='stretch')
             st.write("\n \n")
 
             if pv_total > 0 or custom_pv_file is not None:
@@ -1586,7 +1459,7 @@ with ((tab_analyse)):
                 sorted_loads_pv = df_peaks["load_pv"].sort_values(ascending=False).reset_index(drop=True)
                 fig_load_duration_pv = px.line(sorted_loads_pv, title="🔺 Lastdauerkurve (mit PV)")
                 fig_load_duration_pv.update_layout(yaxis_title="Last (kW)", xaxis_title="Anzahl Stunden (sortiert nach Last)")
-                st.plotly_chart(fig_load_duration_pv, use_container_width=True)
+                st.plotly_chart(fig_load_duration_pv, width='stretch')
                 st.write("\n \n")
 
                 st.subheader("Lastdauerkurve mit und ohne PV ")
@@ -1623,7 +1496,7 @@ with ((tab_analyse)):
                     legend_title="Legende"
                 )
 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             ##########################################
 
 
@@ -1949,7 +1822,7 @@ with taboptimierer:
                     dragmode='pan'  # Optimize for panning instead of zoom by default
                 )
                 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
                 
                 # Technical Parameters - moved below graph with box styling
                 st.markdown("#### 🔧 Technische Parameter")
@@ -2299,7 +2172,7 @@ with tabsimulation:
                     legend=dict(title="Legend")
                 )
 
-                st.plotly_chart(fig_battery_peakshaving, use_container_width=True)
+                st.plotly_chart(fig_battery_peakshaving, width='stretch')
 
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ZUSAMMENFASSUNG BATTERIE OHNE PV CASE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 with st.container(border=True):
@@ -2522,7 +2395,7 @@ with tabsimulation:
                 )
 
                 # Display the optimized figure
-                st.plotly_chart(fig_batt_exp_pv_2, use_container_width=True)
+                st.plotly_chart(fig_batt_exp_pv_2, width='stretch')
 
 
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2643,7 +2516,7 @@ with tabsimulation:
                         font=dict(size=14)
                     )
 
-                    st.plotly_chart(fig_detailed_pv_bt, use_container_width=True)
+                    st.plotly_chart(fig_detailed_pv_bt, width='stretch')
 
                 with st.expander("Monatliche Batterie-Nutzung"):
                     monthly_summary = df_exp_2.groupby('month').agg({
@@ -2669,7 +2542,7 @@ with tabsimulation:
                         xaxis_title="Monat", yaxis_title="Energie (kWh)",
                         height=400, margin=dict(l=20, r=20, t=40, b=20)
                     )
-                    st.plotly_chart(fig_month, use_container_width=True)
+                    st.plotly_chart(fig_month, width='stretch')
 
                 with st.expander("Batterie Ladezyklen"):
                     import plotly.subplots as sp
@@ -2698,7 +2571,7 @@ with tabsimulation:
                         title="Batterie Lade- und Entladeleistung",
                         height=600, margin=dict(l=20, r=20, t=40, b=20)
                     )
-                    st.plotly_chart(fig_batt, use_container_width=True)
+                    st.plotly_chart(fig_batt, width='stretch')
 
                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ DETAIL BOXEN PV CASE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 with st.container(border=True):
@@ -2809,7 +2682,7 @@ with tabsimulation:
                 col_preset1, col_preset2, col_preset3, col_preset_spacer = st.columns([1, 1, 1, 3])
                 
                 with col_preset1:
-                    if st.button("🔧 HLZ 2024", use_container_width=True):
+                    if st.button("🔧 HLZ 2024", width='stretch'):
                         # Winter: 7:15 - 12:00 and 16:30 - 19:15
                         st.session_state['enable_Winter'] = True
                         st.session_state['enable_Frühling'] = False
@@ -2823,7 +2696,7 @@ with tabsimulation:
                         st.rerun()
                 
                 with col_preset2:
-                    if st.button("🔧 HLZ 2025", use_container_width=True):
+                    if st.button("🔧 HLZ 2025", width='stretch'):
                         # Winter: 8:00 - 13:30 and 16:30 - 19:15
                         st.session_state['enable_Winter'] = True
                         st.session_state['enable_Frühling'] = False
@@ -2837,7 +2710,7 @@ with tabsimulation:
                         st.rerun()
                 
                 with col_preset3:
-                    if st.button("🔧 HLZ 2026", use_container_width=True):
+                    if st.button("🔧 HLZ 2026", width='stretch'):
                         # Winter: 7:15 - 12:00 and 16:30 - 19:15, Autumn: 17:30 - 18:00
                         st.session_state['enable_Winter'] = True
                         st.session_state['enable_Frühling'] = False
@@ -3044,7 +2917,7 @@ with tabsimulation:
                         showlegend=True
                     )
                     
-                    st.plotly_chart(fig_hlz_overview, use_container_width=True)
+                    st.plotly_chart(fig_hlz_overview, width='stretch')
                     
                     # Display enhanced metrics with date/time information
                     col_info1, col_info2, col_info3 = st.columns(3)
@@ -3136,7 +3009,7 @@ with tabsimulation:
                     
                     if peak_stats:
                         stats_df = pd.DataFrame(peak_stats)
-                        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+                        st.dataframe(stats_df, width='stretch', hide_index=True)
                     
                     hlz_percentage = df_atypik['in_window'].sum() / len(df_atypik) * 100
                     st.info(f"🕐 **Gesamt:** {len(window_periods)} HLZ-Perioden mit {df_atypik['in_window'].sum()} Datenpunkten ({hlz_percentage:.1f}% der Zeit)")
@@ -3144,7 +3017,7 @@ with tabsimulation:
                     st.write("---")
                     
                     # BUTTON TO START BATTERY CALCULATION
-                    if st.button("🔋 Batterie-Simulation für HLZ starten", type="primary", use_container_width=True):
+                    if st.button("🔋 Batterie-Simulation für HLZ starten", type="primary", width='stretch'):
                         
                         if len(df_atypik) > 0 and peak_in_hlz > 0:
                             st.write("### 🔋 Batterie-Simulation läuft...")
@@ -3225,7 +3098,7 @@ with tabsimulation:
                                 "Relevanz für Netzentgelt": ["✅ Ja (HLZ)", "❌ Nein", "Gemischt"]
                             }
                             summary_df = pd.DataFrame(summary_data)
-                            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                            st.dataframe(summary_df, width='stretch', hide_index=True)
                             
                             st.write("---")
                             
@@ -3304,7 +3177,7 @@ with tabsimulation:
                                 showlegend=True
                             )
                             
-                            st.plotly_chart(fig_atypik_detailed, use_container_width=True)
+                            st.plotly_chart(fig_atypik_detailed, width='stretch')
                             
                             # Battery usage metrics
                             st.write("### 🔋 Batterie-Nutzungsstatistiken")

@@ -8,9 +8,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from src.config import INTERVAL_HOURS
+from src.config import INTERVAL_HOURS, CACHE_TTL
 
-
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Loading price data...")
 def read_price_data(price_year: int = 2024) -> pd.DataFrame:
     """Read spot price data for specified year (2024 or 2025)
     
@@ -48,7 +48,7 @@ def read_price_data(price_year: int = 2024) -> pd.DataFrame:
     
     return df_prices
 
-
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Loading load profile...")
 def read_load_profile(file_path: Union[str, Path]) -> pd.DataFrame:
     """Read load profile from Excel file or uploaded file object
     
@@ -134,7 +134,7 @@ def read_load_profile(file_path: Union[str, Path]) -> pd.DataFrame:
     
     return df
 
-
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Loading solar data...")
 def load_solar_data(pv_total: float, custom_pv_file: Optional[Union[str, Path]] = None) -> pd.DataFrame:
     """Load and process solar generation data
     

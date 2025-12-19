@@ -27,6 +27,7 @@ from src.config import (
 )
 from src.data.loaders import read_price_data, read_load_profile, load_solar_data
 from src.battery.simulators import battery_simulation_ps
+from src.battery.analysis import _smart_battery_core
 
 # Legacy constants for backward compatibility (can be removed later)
 PV_CAPACITY_KWP = 0
@@ -260,205 +261,22 @@ def run_battery_analysis(file_path, power_rating=100, capacity=215, pv_capacity=
         arbitrage_charge_prices = np.zeros(len(df_case_4))  # Track charging prices
         arbitrage_discharge_prices = np.zeros(len(df_case_4))  # Track discharge prices
         
-        total_energy_charged = 0.0
+        # === MAIN SIMULATION LOOP (Numba-optimized for 20-50x speedup) ===
+        results = _smart_battery_core(
+            net_load_kw_np, net_load_kwh, price, future_price_low, future_price_high,
+            future_peak_max_kw, future_excess_energy_kwh,
+            peak_shaving_threshold_kw, battery_capacity_kwh, battery_power_kw,
+            min_soc_kwh, other_uses_max_soc_kwh, interval_hours,
+            peak_shaving_capacity_percent, peak_load, arbitrage_enabled,
+            BATTERY_EFFICIENCY
+        )
         
-        # === MAIN SIMULATION LOOP ===
-        for idx in range(len(df_case_4)):
-            net_load_kw = net_load_kw_np[idx]
-            net_load_kwh_interval = net_load_kwh[idx]
-            current_price = price[idx]
-            low_price_threshold = future_price_low[idx]
-            high_price_threshold = future_price_high[idx]
-            future_peak_value = future_peak_max_kw[idx]
-            required_energy_for_peak = future_excess_energy_kwh[idx]
-            
-            # Initialize interval values
-            battery_discharge_kwh_interval = 0.0
-            battery_discharge_kwh_interval_ls = 0.0
-            battery_discharge_kwh_interval_ps = 0.0
-
-            grid_import_kwh_interval = 0.0
-            grid_export_kwh_interval = 0.0
-            grid_export_pv_kwh_interval = 0.0  # New: Track PV export separately
-            grid_import_avoided_arbitrage_kwh_interval = 0.0  # New: Track grid import avoided by arbitrage
-
-            battery_charge_kwh_interval = 0.0
-            battery_charge_kwh_interval_pv = 0.0
-            battery_charge_kwh_interval_grid = 0.0
-            
-            battery_power_kwh = battery_power_kw * interval_hours
-            
-            # Start with base net load
-            grid_import_kwh_interval = max(0, net_load_kwh_interval)
-            grid_import_kw_interval = grid_import_kwh_interval / interval_hours
-
-            action_taken = 0
-            
-            # 1. Peak Shaving
-            if net_load_kw > peak_shaving_threshold_kw:
-                discharge_needed_kwh = (net_load_kw - peak_shaving_threshold_kw) * interval_hours
-                # Peak-shaving can only discharge down to other_uses_max_soc_kwh (the capacity reserved for other use cases)
-                peak_shaving_min_limit = max(depth_of_discharge, other_uses_max_soc_kwh)
-                max_discharge_possible_kwh = min(battery_power_kwh, (battery_soc_kwh - peak_shaving_min_limit))
-                actual_discharge_kwh = min(discharge_needed_kwh, max(0, max_discharge_possible_kwh))
-                
-                if actual_discharge_kwh > 0:
-                    battery_discharge_kwh_interval = actual_discharge_kwh
-                    battery_discharge_kwh_interval_ps += actual_discharge_kwh
-                    battery_soc_kwh -= battery_discharge_kwh_interval
-                    grid_import_kwh_interval = max(0, net_load_kwh_interval - battery_discharge_kwh_interval)
-                    action_taken = 1
-                else:
-                    action_taken = 0
-
-            
-            # 2. PV Surplus Charging
-            elif net_load_kw < 0 and action_taken == 0:
-                charge_potential_kwh_interval = abs(net_load_kwh_interval)
-                # PV can charge up to full battery capacity
-                # Peak-shaving will respect its capacity reservation when discharging
-                max_charge_possible_kwh_interval = min(battery_power_kwh, battery_capacity_kwh - battery_soc_kwh)
-                actual_charge_from_PV_kwh_interval = min(charge_potential_kwh_interval, max(0, max_charge_possible_kwh_interval))
-                
-                if actual_charge_from_PV_kwh_interval > 0:
-                    battery_charge_kwh_interval_pv = actual_charge_from_PV_kwh_interval
-                    battery_soc_kwh += battery_charge_kwh_interval_pv * BATTERY_EFFICIENCY
-                    total_energy_charged += battery_charge_kwh_interval_pv
-                    grid_export_kwh_interval = charge_potential_kwh_interval - battery_charge_kwh_interval_pv
-                    grid_export_pv_kwh_interval = grid_export_kwh_interval  # Track PV export separately
-                    grid_import_kwh_interval = 0
-                    action_taken = 1
-                else:
-                    action_taken = 0
-            
-
-            # 3. Arbitrage and Emergency Charging
-             # Threshold > net_load_kwh > 0
-
-            else: 
-                # 3.1 Emergency charging for upcoming peak (only when peak shaving is active)
-                future_peak_detected = future_peak_value > peak_shaving_threshold_kw
-                peak_reserve_soc = min(battery_capacity_kwh, min_soc_kwh + required_energy_for_peak) if peak_shaving_capacity_percent > 0 else min_soc_kwh
-                
-                # Emergency charging can charge up to full battery capacity (including peak-shaving reserved capacity)
-                # because it's preparing for peak-shaving
-                if peak_shaving_capacity_percent > 0 and future_peak_detected and battery_soc_kwh < peak_reserve_soc:
-                    max_charge_without_exceeding_threshold = max(0, (peak_shaving_threshold_kw - grid_import_kwh_interval / interval_hours) * interval_hours)
-                    charge_amount_kwh = min(
-                        max_charge_without_exceeding_threshold,
-                        battery_power_kw * interval_hours,
-                        battery_capacity_kwh - battery_soc_kwh,
-                        peak_reserve_soc - battery_soc_kwh)
-                    
-                    if charge_amount_kwh > 0:
-                        battery_charge_kwh_interval_grid = charge_amount_kwh
-                        battery_soc_kwh += charge_amount_kwh * BATTERY_EFFICIENCY
-                        total_energy_charged += charge_amount_kwh
-                        grid_import_kwh_interval += charge_amount_kwh
-
-                    action_taken = 1 if charge_amount_kwh != 0 else 0
-                
-                # # Arbitrage charging (negative prices) - can charge in addition to emergency charging if it's cheap
-                # if current_price < 0 and battery_soc_kwh < battery_capacity_kwh:
-                #     charge_amount_kwh = min(
-                #         battery_power_kwh,
-                #         battery_capacity_kwh - battery_soc_kwh,
-                #         (peak_shaving_threshold_kw - grid_import_kwh_interval / interval_hours) * interval_hours
-                #     )
-                #     if charge_amount_kwh > 0:
-                #         battery_charge_kwh_interval_grid += charge_amount_kwh
-                #         battery_soc_kwh += charge_amount_kwh * BATTERY_EFFICIENCY
-                #         total_energy_charged += charge_amount_kwh * BATTERY_EFFICIENCY
-                #         grid_import_kwh_interval += charge_amount_kwh
-                
-                # 3.2 Arbitrage charging (low prices)  - can charge in addition to emergency charging if it's cheap
-                # Only charge if future high price is profitable after efficiency losses
-                min_profitable_discharge_price = current_price / BATTERY_EFFICIENCY + MIN_ARBITRAGE_SPREAD
-                arbitrage_is_profitable = high_price_threshold >= min_profitable_discharge_price
-                
-                # For very negative prices, always charge - we're being paid to consume!
-                is_very_negative_price = current_price <= NEGATIVE_PRICE_THRESHOLD
-                
-                # Charge if: (low price AND profitable) OR very negative price
-                should_charge = (current_price <= low_price_threshold and arbitrage_is_profitable) or is_very_negative_price
-                
-                if should_charge and battery_soc_kwh < battery_capacity_kwh and arbitrage_enabled:
-                    # Calculate max charge without exceeding peak
-                    if peak_shaving_capacity_percent > 0:
-                        max_charge_without_exceeding_threshold = max(
-                            0, (peak_shaving_threshold_kw - grid_import_kwh_interval / interval_hours) * interval_hours)
-                    else:
-                        # Don't create a new peak - stay below original peak_load
-                        max_charge_without_exceeding_threshold = max(
-                            0, (peak_load - grid_import_kwh_interval / interval_hours) * interval_hours)
-                    
-                    # Arbitrage can charge to full battery capacity
-                    charge_amount_kwh = min(
-                        max_charge_without_exceeding_threshold,
-                        battery_power_kwh,
-                        battery_capacity_kwh - battery_soc_kwh
-                    )
-                    if charge_amount_kwh > 0:
-                        battery_charge_kwh_interval_grid += charge_amount_kwh
-                        battery_soc_kwh += charge_amount_kwh * BATTERY_EFFICIENCY
-                        total_energy_charged += charge_amount_kwh
-                        grid_import_kwh_interval += charge_amount_kwh
-                        # Track arbitrage charging
-                        arbitrage_charge_energy_kwh[idx] = charge_amount_kwh
-                        arbitrage_charge_prices[idx] = current_price
-
-                    action_taken = 1 if charge_amount_kwh != 0 else 0
-
-                # 3.3 Arbitrage discharging (high prices) - reduce grid import instead of exporting
-                # When peak_shaving is disabled, be more aggressive: only check min_soc, not peak_reserve
-                # Only discharge if current price is profitable compared to typical charge price
-                # If we charged at negative prices, any positive discharge price is profitable
-                if low_price_threshold < 0:
-                    discharge_is_profitable = current_price > 0  # Any positive price is profitable if we charged at negative
-                else:
-                    min_profitable_current_price = low_price_threshold / BATTERY_EFFICIENCY + MIN_ARBITRAGE_SPREAD
-                    discharge_is_profitable = current_price >= min_profitable_current_price
-                
-                min_reserve_for_check = min_soc_kwh if peak_shaving_capacity_percent == 0 else peak_reserve_soc
-                if (current_price >= high_price_threshold and action_taken == 0 and
-                    battery_soc_kwh > min_reserve_for_check and 
-                    (battery_charge_kwh_interval_pv + battery_charge_kwh_interval_grid) == 0.0 and
-                    grid_import_kwh_interval > 0 and discharge_is_profitable) and arbitrage_enabled == True:
-                    
-                    # Arbitrage can only discharge down to min_soc_kwh, respecting the minimum SoC
-                    # When peak_shaving is disabled, no need to reserve for peak events
-                    required_reserve = min_soc_kwh if peak_shaving_capacity_percent == 0 else max(min_soc_kwh, peak_reserve_soc)
-                    max_discharge_for_arbitrage = max(0.0, battery_soc_kwh - required_reserve)
-                    # Can only discharge up to the amount we need to import from grid
-                    discharge_amount_kwh = min(battery_power_kwh, max_discharge_for_arbitrage, grid_import_kwh_interval)
-                    
-                    if discharge_amount_kwh > 0:
-                        battery_soc_kwh -= discharge_amount_kwh
-                        battery_discharge_kwh_interval += discharge_amount_kwh
-                        battery_discharge_kwh_interval_ls += discharge_amount_kwh
-                        # Reduce grid import instead of adding to grid export
-                        grid_import_kwh_interval -= discharge_amount_kwh
-                        grid_import_avoided_arbitrage_kwh_interval = discharge_amount_kwh  # Track avoided grid import
-                        # Track arbitrage discharging
-                        arbitrage_discharge_energy_kwh[idx] = discharge_amount_kwh
-                        arbitrage_discharge_prices[idx] = current_price
-                        action_taken = 1
-                    else:
-                        action_taken = 0
-
-            
-            # Store results
-            battery_discharge_kw[idx] = battery_discharge_kwh_interval / interval_hours
-            battery_discharge_ls_kw[idx] = battery_discharge_kwh_interval_ls / interval_hours
-            battery_discharge_ps_kw[idx] = battery_discharge_kwh_interval_ps / interval_hours
-
-            battery_soc_kwh_arr[idx] = battery_soc_kwh
-            
-            grid_import_kw[idx] = grid_import_kwh_interval / interval_hours
-            grid_export_kw[idx] = grid_export_kwh_interval / interval_hours
-            grid_export_pv_kw[idx] = grid_export_pv_kwh_interval / interval_hours  # Store PV export
-            grid_import_avoided_arbitrage_kw[idx] = grid_import_avoided_arbitrage_kwh_interval / interval_hours  # Store avoided import
-            battery_charge_kw[idx] = (battery_charge_kwh_interval_grid + battery_charge_kwh_interval_pv) / interval_hours
+        # Unpack results from Numba function
+        (battery_discharge_kw, battery_discharge_ps_kw, battery_discharge_ls_kw,
+         battery_soc_kwh_arr, grid_import_kw, grid_export_kw, grid_export_pv_kw,
+         grid_import_avoided_arbitrage_kw, battery_charge_kw,
+         arbitrage_charge_energy_kwh, arbitrage_discharge_energy_kwh,
+         arbitrage_charge_prices, arbitrage_discharge_prices) = results
         
         # Update dataframe with results
         df_case_4['battery_discharge_kw'] = battery_discharge_kw
@@ -1638,8 +1456,8 @@ def main():
     if enable_optimization:
         resample_freq = st.sidebar.selectbox(
             "Resampling-Frequenz:",
-            options=["15T", "30T", "1H", "2H", "4H"],
-            index=2,  # Default to 1H
+            options=["15min", "30min", "1h", "2h", "4h"],
+            index=2,  # Default to 1h
             help="Zeitintervall für Datenresampling (kleiner = mehr Details, langsamer)"
         )
         
@@ -1755,7 +1573,8 @@ def main():
             ps_percent = st.session_state.get('peak_shaving_capacity_percent', 100)
             st.plotly_chart(
                 create_load_profile_chart(df, threshold, ps_percent),
-                use_container_width=True
+                width='stretch',
+                config={'displayModeBar': False}
             )
 ####################################################
         col_kpis_1, col_kpis_2, col_kpis_3,col_kpis_4 = st.columns(4)
@@ -1960,7 +1779,7 @@ def main():
         #                                         savings_eur=savings_eur, 
         #                                         original_peak=peak_load_case_1, 
         #                                         reduced_peak=peak_load_case_4), 
-        #                 use_container_width=True)
+        #                 width='stretch')
 
         # st.plotly_chart(
         #     create_load_profile_chart_2(df, threshold),
@@ -1971,13 +1790,15 @@ def main():
         with st.expander("🔋 Batterie-Details anzeigen (SoC-Verlauf)", expanded=False):
             st.plotly_chart(
                 create_soc_chart(df),
-                use_container_width=True
+                width='stretch',
+                config={'displayModeBar': False}
             )
         
         # Price chart below
         st.plotly_chart(
             create_price_chart(df),
-            use_container_width=True
+            width='stretch',
+            config={'displayModeBar': False}
         )
         
         # Add legend for price chart outside the chart
@@ -1999,7 +1820,7 @@ def main():
                             'battery_charge_kw', 'battery_discharge_kw', 'battery_soc_kwh',
                             'price', 'future_price_low', 'future_price_high']
             available_cols = [col for col in display_cols if col in df.columns]
-            st.dataframe(df[available_cols].head(100), use_container_width=True)
+            st.dataframe(df[available_cols].head(100), width='stretch')
 
     else:
         # Welcome message

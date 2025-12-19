@@ -5,7 +5,9 @@ Data processing functions.
 import pandas as pd
 import streamlit as st
 
+from src.config import CACHE_TTL
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def handle_german_dst_transitions(df: pd.DataFrame) -> pd.DataFrame:
     """Handle German DST transitions for load profile data.
     

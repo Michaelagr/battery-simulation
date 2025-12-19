@@ -22,7 +22,8 @@ NEGATIVE_PRICE_THRESHOLD = -0.01  # €/kWh
 # Performance settings
 ENABLE_CHART_OPTIMIZATION = True
 MIN_POINTS_FOR_RESAMPLING = 10000
-RESAMPLE_FREQUENCY = "1H"
+RESAMPLE_FREQUENCY = "1h"  # Updated: lowercase 'h' (pandas 2.2+ deprecates 'H')
+CACHE_TTL = 3600
 
 # Feature flags
 ENABLE_ARBITRAGE = True  # Enable energy arbitrage (load shifting) by default
